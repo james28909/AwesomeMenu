@@ -1,0 +1,7 @@
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/comtext_flyout.dir
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/edit_cache.dir
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/rebuild_cache.dir
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/list_install_components.dir
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/install.dir
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/install/local.dir
+/home/runner/work/comtext-flyout/comtext-flyout/build/CMakeFiles/install/strip.dir
