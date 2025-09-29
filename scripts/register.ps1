@@ -1,7 +1,8 @@
 Param(
-    [ValidateSet('Debug','Release')]
-    [string]$Config = 'Debug',
-    [switch]$Rebuild
+  [ValidateSet('Debug','Release')]
+  [string]$Config = 'Debug',
+  [switch]$Rebuild,
+  [switch]$NoRestart
 )
 
 Set-StrictMode -Version Latest
@@ -19,25 +20,42 @@ if (-not (Test-Path $dll)) { throw "DLL not found: $dll. Use -Rebuild to build i
 
 # Per-user COM registration - everything under HKCU\Software\Classes
 $guid = '{E0E8C3B2-1E8C-4C15-9A4F-8A7C0F4A7F10}'
-reg add "HKCU\Software\Classes\CLSID\$guid\InprocServer32" /ve /t REG_SZ /d "$dll" /f | Out-Null
-reg add "HKCU\Software\Classes\CLSID\$guid\InprocServer32" /v ThreadingModel /t REG_SZ /d Apartment /f | Out-Null
 
-# Context menu handlers under HKCU\Software\Classes (per-user only)
-# Using highly selective registration to avoid any overlapping contexts
-reg add "HKCU\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
+# Helper to set a registry value and emit detail when running in verbose consoles
+function Set-RegistryString {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [string]$Name,
+    [Parameter(Mandatory)][string]$Value
+  )
 
-# Register for specific file types instead of * (which conflicts with folder contexts)
-reg add "HKCU\Software\Classes\txtfile\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-reg add "HKCU\Software\Classes\batfile\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-reg add "HKCU\Software\Classes\cmdfile\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
+  $null = New-Item -Path $Path -Force
+  Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type String
+}
 
-# NOTE: Using specific file types instead of * to prevent folder/file context conflicts
-# This should eliminate duplicate menus in navigation pane while maintaining file support
+$clsidRoot = "HKCU:\Software\Classes\CLSID\$guid"
+Set-RegistryString -Path $clsidRoot -Name '(default)' -Value 'AwesomeMenuHost Shell Extension'
+Set-RegistryString -Path "$clsidRoot\InprocServer32" -Name '(default)' -Value $dll
+Set-RegistryString -Path "$clsidRoot\InprocServer32" -Name 'ThreadingModel' -Value 'Apartment'
 
-# Note: We only register the COM handler, not direct shell entries
-# AwesomeMenuHost will read from the existing AwesomeMenu registry structure
+# Register handler across standard shell contexts
+$handlerTargets = @(
+  'HKCU:\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost',
+  'HKCU:\Software\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost',
+  'HKCU:\Software\Classes\Folder\shellex\ContextMenuHandlers\AwesomeMenuHost',
+  'HKCU:\Software\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost',
+  'HKCU:\Software\Classes\AllFileSystemObjects\shellex\ContextMenuHandlers\AwesomeMenuHost',
+  'HKCU:\Software\Classes\Drive\shellex\ContextMenuHandlers\AwesomeMenuHost'
+)
+
+foreach ($target in $handlerTargets) {
+  Set-RegistryString -Path $target -Name '(default)' -Value $guid
+}
 
 Write-Host "Registered AwesomeMenuHost per-user." -ForegroundColor Green
-Write-Host "Restarting Explorer..." -ForegroundColor Yellow
-Stop-Process -Name explorer -Force
-Start-Process explorer.exe
+
+if (-not $NoRestart) {
+  Write-Host "Restarting Explorer..." -ForegroundColor Yellow
+  Start-Process -FilePath 'taskkill' -ArgumentList '/F','/IM','explorer.exe' -NoNewWindow -Wait
+  Start-Process explorer.exe
+}

@@ -1,0 +1,51 @@
+# Editor and assistant settings
+/.vscode/
+/.claude/
+.vs/
+
+# Local scratch space
+/New folder/
+/comtext-flyout.code-workspace
+
+# CMake / Visual Studio build trees
+/build/
+/out/
+/cmake-build*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/CMakeScripts/
+**/CTestTestfile.cmake
+**/Makefile
+**/compile_commands.json
+**/build.ninja
+**/rules.ninja
+
+# Generated build outputs
+**/*.obj
+**/*.pdb
+**/*.lib
+**/*.exp
+**/*.ilk
+**/*.idb
+**/*.ipch
+**/*.tlog
+**/*.lastbuildstate
+**/*.recipe
+**/*.log
+**/*.cache
+**/*.VC.db
+**/*.VC.opendb
+**/*.VC.db-shm
+**/*.VC.db-wal
+
+# Visual Studio user-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj.user
+
+# OS-specific cruft
+Thumbs.db
+.DS_Store

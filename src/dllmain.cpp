@@ -26,6 +26,7 @@
  */
 
 #include <windows.h>        // Core Windows API definitions
+#include <array>            // std::array for handler registration tables
 #include "Guids.h"          // Contains CLSID definitions for our COM classes
 #include "ClassFactory.h"   // COM class factory implementation
 #include <new>              // For std::nothrow operator
@@ -146,6 +147,48 @@ static HRESULT WriteRegSZ(HKEY root, const wchar_t* subKey, const wchar_t* name,
 }
 
 /**
+ * Helper function to register the context menu handler under each desired object type.
+ * Mirrors the guidance to bind the same CLSID to directories, files, drives, etc.
+ */
+static HRESULT RegisterHandlerContexts(const wchar_t* clsidStr) {
+    constexpr std::array<const wchar_t*, 6> kContextPaths = {
+        L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\Directory\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\Folder\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\AllFileSystemObjects\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\Drive\\shellex\\ContextMenuHandlers\\AwesomeMenuHost"
+    };
+
+    for (const auto* path : kContextPaths) {
+        HRESULT hr = WriteRegSZ(HKEY_CURRENT_USER, path, nullptr, clsidStr);
+        if (FAILED(hr)) {
+            return hr;
+        }
+    }
+
+    return S_OK;
+}
+
+/**
+ * Helper function to remove all handler registrations during unregistration.
+ */
+static void UnregisterHandlerContexts() {
+    constexpr std::array<const wchar_t*, 6> kContextPaths = {
+        L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\Directory\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\Folder\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\AllFileSystemObjects\\shellex\\ContextMenuHandlers\\AwesomeMenuHost",
+        L"Software\\Classes\\Drive\\shellex\\ContextMenuHandlers\\AwesomeMenuHost"
+    };
+
+    for (const auto* path : kContextPaths) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, path);
+    }
+}
+
+/**
  * Standard COM Export - Registers this DLL's COM classes and shell extensions
  * Called during installation or when regsvr32 is used to register the DLL
  * Registers the context menu handler for directory backgrounds and folders
@@ -163,14 +206,19 @@ extern "C" HRESULT __stdcall DllRegisterServer(void) {
 
     // Use per-user registration under HKCU\Software\Classes so elevation is not required
     // This allows installation without administrator privileges
-    
+    // Register the COM class root with a friendly description
+    wchar_t clsidKey[512];
+    wsprintfW(clsidKey, L"Software\\Classes\\CLSID\\%s", clsidStr);
+    HRESULT hr = WriteRegSZ(HKEY_CURRENT_USER, clsidKey, nullptr, L"AwesomeMenuHost Shell Extension");
+    if (FAILED(hr)) return hr;
+
     // Register the COM class as an in-process server (DLL)
     // Path: HKCU\Software\Classes\CLSID\{CLSID}\InprocServer32
     wchar_t inproc[512]; 
-    wsprintfW(inproc, L"Software\\Classes\\CLSID\\%s\\InprocServer32", clsidStr);
-    
+    wsprintfW(inproc, L"%s\\InprocServer32", clsidKey);
+
     // Set the DLL path as the server location
-    HRESULT hr = WriteRegSZ(HKEY_CURRENT_USER, inproc, nullptr, modulePath);
+    hr = WriteRegSZ(HKEY_CURRENT_USER, inproc, nullptr, modulePath);
     if (FAILED(hr)) return hr;
     
     // Set the threading model to "Apartment" for shell extensions
@@ -178,19 +226,10 @@ extern "C" HRESULT __stdcall DllRegisterServer(void) {
     hr = WriteRegSZ(HKEY_CURRENT_USER, inproc, L"ThreadingModel", L"Apartment");
     if (FAILED(hr)) return hr;
 
-    // Register the context menu handler for directory backgrounds
-    // This makes the menu appear when right-clicking on empty space in folders
-    hr = WriteRegSZ(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\AwesomeMenuHost", nullptr, clsidStr);
-    if (FAILED(hr)) return hr;
-    
-    // Register the context menu handler for directory folders themselves
-    // This makes the menu appear when right-clicking on folder icons
-    hr = WriteRegSZ(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shellex\\ContextMenuHandlers\\AwesomeMenuHost", nullptr, clsidStr);
+    // Bind the handler across the common shell extension entry points
+    hr = RegisterHandlerContexts(clsidStr);
     if (FAILED(hr)) return hr;
 
-    // NOTE: We don't create shell entries since AwesomeMenuHost reads from existing AwesomeMenu registry
-    // The AwesomeMenu should appear directly without a "FlyoutHost" wrapper entry
-    if (FAILED(hr)) return hr;
     return S_OK;
 }
 
@@ -206,22 +245,14 @@ extern "C" HRESULT __stdcall DllUnregisterServer(void) {
     wchar_t clsidStr[64]; 
     StringFromGUID2(CLSID_AwesomeMenu, clsidStr, ARRAYSIZE(clsidStr));
     
-    // Build the InprocServer32 registry key path
-    wchar_t inproc[512]; 
-    wsprintfW(inproc, L"Software\\Classes\\CLSID\\%s\\InprocServer32", clsidStr);
-    
-    // Delete the COM class registration (InprocServer32 key and all subkeys)
-    RegDeleteTreeW(HKEY_CURRENT_USER, inproc);
-    
-    // Delete the directory background context menu handler registration
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\AwesomeMenuHost");
-    
-    // Delete the directory folder context menu handler registration
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shellex\\ContextMenuHandlers\\AwesomeMenuHost");
-    
-    // Commented out: Additional registration for all file types (not currently used)
-    // RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\AwesomeMenuHost");
-    
+    // Build the CLSID registry key path and remove the entire subtree
+    wchar_t clsidKey[512];
+    wsprintfW(clsidKey, L"Software\\Classes\\CLSID\\%s", clsidStr);
+    RegDeleteTreeW(HKEY_CURRENT_USER, clsidKey);
+
+    // Remove all handler registrations
+    UnregisterHandlerContexts();
+
     // Always return success - registry cleanup errors are generally not critical
     return S_OK;
 }

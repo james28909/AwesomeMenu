@@ -1,27 +1,45 @@
+Param(
+	[switch]$KeepExplorer
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $guid = '{E0E8C3B2-1E8C-4C15-9A4F-8A7C0F4A7F10}'
 
-reg delete "HKCU\Software\Classes\CLSID\$guid" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\Folder\ShellEx\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
+$pathsToRemove = @(
+	"HKCU:\Software\Classes\CLSID\$guid",
+	'HKCU:\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost',
+	'HKCU:\Software\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost',
+	'HKCU:\Software\Classes\Folder\shellex\ContextMenuHandlers\AwesomeMenuHost',
+	'HKCU:\Software\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost',
+	'HKCU:\Software\Classes\AllFileSystemObjects\shellex\ContextMenuHandlers\AwesomeMenuHost',
+	'HKCU:\Software\Classes\Drive\shellex\ContextMenuHandlers\AwesomeMenuHost'
+)
 
-# Clean up HKLM system-wide entries
-reg delete "HKLM\SOFTWARE\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
-reg delete "HKLM\SOFTWARE\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
-reg delete "HKLM\SOFTWARE\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
-reg delete "HKLM\SOFTWARE\Classes\Folder\ShellEx\ContextMenuHandlers\AwesomeMenuHost" /f 2>$null | Out-Null
+foreach ($path in $pathsToRemove) {
+	if (Test-Path $path) {
+		Remove-Item -Path $path -Recurse -Force
+	}
+}
 
-# Also clean up old FlyoutHost entries if they exist
-reg delete "HKCU\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\FlyoutHost" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\Directory\shellex\ContextMenuHandlers\FlyoutHost" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\Directory\Background\shell\FlyoutHost" /f 2>$null | Out-Null
-reg delete "HKCU\Software\Classes\Directory\shell\FlyoutHost" /f 2>$null | Out-Null
+$legacyCleanup = @(
+	'HKCU:\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\FlyoutHost',
+	'HKCU:\Software\Classes\Directory\shellex\ContextMenuHandlers\FlyoutHost',
+	'HKCU:\Software\Classes\Directory\Background\shell\FlyoutHost',
+	'HKCU:\Software\Classes\Directory\shell\FlyoutHost'
+)
+
+foreach ($path in $legacyCleanup) {
+	if (Test-Path $path) {
+		Remove-Item -Path $path -Recurse -Force
+	}
+}
 
 Write-Host "Unregistered AwesomeMenuHost per-user keys." -ForegroundColor Green
-Write-Host "Restarting Explorer..." -ForegroundColor Yellow
-Stop-Process -Name explorer -Force
-Start-Process explorer.exe
+
+if (-not $KeepExplorer) {
+	Write-Host "Restarting Explorer..." -ForegroundColor Yellow
+	Start-Process -FilePath 'taskkill' -ArgumentList '/F','/IM','explorer.exe' -NoNewWindow -Wait
+	Start-Process explorer.exe
+}
