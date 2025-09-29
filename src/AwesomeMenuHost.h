@@ -32,6 +32,8 @@
 
 // STL containers for menu structure management
 #include <string>           // std::wstring for Unicode string handling
+#include <string_view>      // std::wstring_view for logging helpers
+#include <set>              // std::set for registry management metadata
 #include <vector>           // Dynamic arrays for menu items and flyouts
 #include <map>              // ID-to-path mapping for menu command resolution
 
@@ -132,6 +134,26 @@ enum class ContextKind {
     ProjectLocation    // Detected development project folders
 };
 
+enum class LogCategory {
+    General,
+    Context,
+    Registry,
+    Menu,
+    Error
+};
+
+struct ContextSnapshot {
+    ContextKind kind = ContextKind::Background;
+    std::wstring contextDir;
+    std::vector<std::wstring> selection;
+
+    bool hasSelection() const noexcept { return !selection.empty(); }
+    const std::wstring& primarySelection() const noexcept {
+        static const std::wstring empty;
+        return selection.empty() ? empty : selection.front();
+    }
+};
+
 class AwesomeMenuHost : public IShellExtInit, public IContextMenu3 {
 public:
     // Constructor/Destructor with COM reference counting
@@ -194,10 +216,7 @@ private:
      * =============================================
      * This information tells us what the user right-clicked on and where.
      */
-    std::wstring m_contextDir;                  // Working directory context:
-                                               // - Background click: the folder being viewed
-                                               // - File selection: parent folder of selected files
-    std::vector<std::wstring> m_selection;      // Full paths of selected files/folders (empty for background)
+    ContextSnapshot m_context;                  // Snapshot of current invocation context
 
     /*
      * Menu Structure Storage
@@ -205,6 +224,7 @@ private:
      * The loaded menu configuration that will be displayed to the user.
      */
     std::vector<Flyout> m_flyouts;              // Complete menu structure loaded from registry files or hardcoded
+    std::vector<Flyout> m_activeFlyouts;        // Snapshot of menus used for the current invocation
 
     /*
      * Command ID Management (Critical for Menu Execution)
@@ -230,10 +250,9 @@ private:
      * 3. Emergency fallback menu
      */
     void loadConfig();                          // Main entry point - orchestrates hybrid loading strategy
-    void loadFromRegistryFiles();               // LEGACY: Load menus from .reg files (data-driven)
-    void loadRegistryFilesAsSeparateFlyouts();   // NEW: Each .reg file becomes separate flyout
+    void loadRegistryFilesAsSeparateFlyouts();   // Load menus from .reg files without external processes
     void createCompleteAwesomeMenu();           // LEGACY: Static AwesomeMenu with unlimited "As Admin" submenu
-    void createContextAwareAwesomeMenu(ContextKind kind); // NEW: Dynamic context-aware AwesomeMenu
+    Flyout createContextAwareAwesomeMenu(const ContextSnapshot& snapshot); // Dynamic context-aware AwesomeMenu
     void createUnlimitedTestMenu();             // DEVELOPMENT: Test menu for validation
 
     /*
@@ -245,6 +264,12 @@ private:
     void parseRegistryFile(const std::wstring& filePath, Flyout& targetFlyout);       // LEGACY: Complex parser
     void parseRegistryFileSimplified(const std::wstring& filePath, Flyout& targetFlyout); // NEW: Simplified parser
     std::wstring getMenusFolder() const;        // Get %APPDATA%\AwesomeMenuHost\menus\ path
+    bool applyRegistryFile(const std::wstring& fullPath, const std::wstring& fileKey,
+                           std::vector<std::pair<std::wstring, std::wstring>>& recordedEntries);
+    void storeManagedRegistryEntries(const std::wstring& fileKey,
+                                     const std::vector<std::pair<std::wstring, std::wstring>>& entries);
+    void removeManagedEntriesForFile(const std::wstring& fileKey);
+    void purgeMissingRegistryFiles(const std::set<std::wstring>& currentFiles);
 
     /*
      * Legacy Registry Parsing (Original Implementation)
@@ -294,4 +319,13 @@ private:
      * This is where the "ID not found in map" bug was fixed.
      */
     const FlyoutItem* findItemByPath(const std::vector<UINT>& path) const;  // Navigate path to find command
+
+    // Context helpers
+    ContextSnapshot buildContextSnapshot(PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pdtobj);
+    ContextKind detectContextKind(const ContextSnapshot& snapshot) const;
+    UINT buildContextMenu(const ContextSnapshot& snapshot, HMENU hMenu, UINT indexMenu, UINT idCmdFirst, UINT uFlags);
+
+    // Logging helpers
+    void logDebug(std::wstring_view message, LogCategory category = LogCategory::General) const;
+    static std::wstring_view logCategoryName(LogCategory category) noexcept;
 };

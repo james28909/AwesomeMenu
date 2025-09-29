@@ -34,15 +34,343 @@
 #include <vector>            // Dynamic arrays for menu structures
 #include <map>               // ID-to-path mapping for command resolution
 #include <memory>            // Smart pointers for resource management
+#include <set>               // Tracking applied registry files
 #include <shlwapi.h>         // Shell path utilities (PathRemoveFileSpec, PathIsDirectory)
 #include <fstream>           // File I/O for registry file parsing
 #include <shlobj.h>          // Shell folder APIs (SHGetKnownFolderPath)
 #include <algorithm>         // std::transform for string manipulation
+#include <format>            // std::format for structured logging
+#include <cwctype>           // Character casing helpers
+#include <set>               // Track managed registry files
+#include <sstream>           // String composition helpers
+#include <cstring>           // memcpy for registry value buffers
+#include <cstdlib>           // wcstoul helpers
 
 // Global DLL reference counter for COM object lifetime management
 // Incremented when objects created, decremented when destroyed
 // DLL cannot be unloaded while g_cDllRef > 0
 extern long g_cDllRef;
+
+std::wstring_view AwesomeMenuHost::logCategoryName(LogCategory category) noexcept {
+    switch (category) {
+        case LogCategory::Context: return L"Context";
+        case LogCategory::Registry: return L"Registry";
+        case LogCategory::Menu: return L"Menu";
+        case LogCategory::Error: return L"Error";
+        default: return L"General";
+    }
+}
+
+void AwesomeMenuHost::logDebug(std::wstring_view message, LogCategory category) const {
+    std::wstring composed;
+    composed.reserve(message.size() + 32);
+    composed.assign(L"AwesomeMenuHost");
+
+    if (category != LogCategory::General) {
+        composed.append(L"[");
+        composed.append(logCategoryName(category));
+        composed.append(L"]");
+    }
+
+    composed.append(L": ");
+    composed.append(message);
+
+    if (composed.empty() || composed.back() != L'\n') {
+        composed.push_back(L'\n');
+    }
+
+    OutputDebugStringW(composed.c_str());
+}
+
+namespace {
+
+constexpr const wchar_t* kManagedRegistryRoot = L"Software\\AwesomeMenuHost\\RegistryFiles";
+
+void trimInPlace(std::wstring& s) {
+    const auto first = s.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) {
+        s.clear();
+        return;
+    }
+    const auto last = s.find_last_not_of(L" \t\r\n");
+    s.erase(last + 1);
+    s.erase(0, first);
+}
+
+std::wstring toUpperCopy(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towupper(ch));
+    });
+    return s;
+}
+
+bool startsWithInsensitive(const std::wstring& text, const wchar_t* prefix) {
+    size_t len = wcslen(prefix);
+    if (text.size() < len) return false;
+    for (size_t i = 0; i < len; ++i) {
+        if (towupper(text[i]) != towupper(prefix[i])) return false;
+    }
+    return true;
+}
+
+int hexDigit(wchar_t ch) {
+    if (ch >= L'0' && ch <= L'9') return static_cast<int>(ch - L'0');
+    if (ch >= L'a' && ch <= L'f') return 10 + static_cast<int>(ch - L'a');
+    if (ch >= L'A' && ch <= L'F') return 10 + static_cast<int>(ch - L'A');
+    return -1;
+}
+
+std::wstring unescapeRegString(const std::wstring& input) {
+    std::wstring result;
+    result.reserve(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        wchar_t ch = input[i];
+        if (ch == L'\\' && i + 1 < input.size()) {
+            wchar_t next = input[++i];
+            switch (next) {
+                case L'\\': result.push_back(L'\\'); break;
+                case L'"': result.push_back(L'"'); break;
+                case L'0': result.push_back(L'\0'); break;
+                case L'n': result.push_back(L'\n'); break;
+                case L'r': result.push_back(L'\r'); break;
+                case L't': result.push_back(L'\t'); break;
+                default:    result.push_back(next); break;
+            }
+        } else {
+            result.push_back(ch);
+        }
+    }
+    return result;
+}
+
+std::vector<BYTE> parseHexBytes(const std::wstring& data) {
+    std::vector<BYTE> bytes;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t start = pos;
+        while (pos < data.size() && data[pos] != L',') {
+            ++pos;
+        }
+
+        std::wstring token = data.substr(start, pos - start);
+        trimInPlace(token);
+        if (!token.empty()) {
+            wchar_t* endPtr = nullptr;
+            unsigned long value = wcstoul(token.c_str(), &endPtr, 16);
+            if (endPtr != token.c_str()) {
+                bytes.push_back(static_cast<BYTE>(value & 0xFF));
+            }
+        }
+
+        if (pos < data.size() && data[pos] == L',') {
+            ++pos;
+        }
+    }
+    return bytes;
+}
+
+struct ParsedRegValue {
+    DWORD type = REG_NONE;
+    std::vector<BYTE> data;
+};
+
+void ensureWideNullTerminator(std::vector<BYTE>& buffer) {
+    if (buffer.size() % sizeof(wchar_t) != 0) {
+        buffer.push_back(0);
+    }
+    if (buffer.size() % sizeof(wchar_t) != 0) {
+        buffer.push_back(0);
+    }
+
+    const wchar_t* chars = reinterpret_cast<const wchar_t*>(buffer.data());
+    size_t length = buffer.size() / sizeof(wchar_t);
+    if (length == 0 || chars[length - 1] != L'\0') {
+        buffer.push_back(0);
+        buffer.push_back(0);
+    }
+}
+
+std::vector<std::wstring> multiSzToVector(const wchar_t* data, size_t charCount) {
+    std::vector<std::wstring> entries;
+    size_t index = 0;
+    while (index < charCount) {
+        std::wstring entry = data + index;
+        if (entry.empty()) {
+            break;
+        }
+        entries.push_back(std::move(entry));
+        index += entries.back().size() + 1;
+    }
+    return entries;
+}
+
+std::vector<wchar_t> vectorToMultiSz(const std::vector<std::wstring>& entries) {
+    std::vector<wchar_t> buffer;
+    for (const auto& entry : entries) {
+        buffer.insert(buffer.end(), entry.begin(), entry.end());
+        buffer.push_back(L'\0');
+    }
+    buffer.push_back(L'\0');
+    return buffer;
+}
+
+bool parseRegistryValueData(const std::wstring& raw, ParsedRegValue& out) {
+    std::wstring value = raw;
+    trimInPlace(value);
+    if (value.empty()) return false;
+
+    if (value == L"-") {
+        out.type = REG_NONE;
+        out.data.clear();
+        return true;
+    }
+
+    if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') {
+        std::wstring inner = value.substr(1, value.size() - 2);
+        std::wstring unescaped = unescapeRegString(inner);
+        out.type = REG_SZ;
+        out.data.resize((unescaped.size() + 1) * sizeof(wchar_t));
+        memcpy(out.data.data(), unescaped.c_str(), (unescaped.size() + 1) * sizeof(wchar_t));
+        return true;
+    }
+
+    if (startsWithInsensitive(value, L"dword:")) {
+        std::wstring number = value.substr(6);
+        trimInPlace(number);
+        unsigned long parsed = wcstoul(number.c_str(), nullptr, 16);
+        out.type = REG_DWORD;
+        out.data.resize(sizeof(DWORD));
+        memcpy(out.data.data(), &parsed, sizeof(DWORD));
+        return true;
+    }
+
+    if (startsWithInsensitive(value, L"qword:")) {
+        std::wstring number = value.substr(6);
+        trimInPlace(number);
+        unsigned long long parsed = _wcstoui64(number.c_str(), nullptr, 16);
+        out.type = REG_QWORD;
+        out.data.resize(sizeof(unsigned long long));
+        memcpy(out.data.data(), &parsed, sizeof(unsigned long long));
+        return true;
+    }
+
+    if (startsWithInsensitive(value, L"hex")) {
+        size_t colonPos = value.find(L':');
+        if (colonPos == std::wstring::npos) return false;
+
+        std::wstring typeSpec = value.substr(0, colonPos);
+        std::wstring dataSpec = value.substr(colonPos + 1);
+        trimInPlace(dataSpec);
+
+        DWORD regType = REG_BINARY;
+        if (typeSpec.size() > 3) {
+            size_t open = typeSpec.find(L'(');
+            size_t close = typeSpec.find(L')');
+            if (open != std::wstring::npos && close != std::wstring::npos && close > open + 1) {
+                unsigned long typeCode = wcstoul(typeSpec.substr(open + 1, close - open - 1).c_str(), nullptr, 16);
+                switch (typeCode) {
+                    case 2: regType = REG_EXPAND_SZ; break;
+                    case 7: regType = REG_MULTI_SZ; break;
+                    default: regType = REG_BINARY; break;
+                }
+            }
+        }
+
+        std::vector<BYTE> bytes = parseHexBytes(dataSpec);
+        if (regType == REG_EXPAND_SZ || regType == REG_MULTI_SZ) {
+            ensureWideNullTerminator(bytes);
+        }
+
+        out.type = regType;
+        out.data = std::move(bytes);
+        return true;
+    }
+
+    // Fallback: treat as plain string without quotes
+    std::wstring unescaped = unescapeRegString(value);
+    out.type = REG_SZ;
+    out.data.resize((unescaped.size() + 1) * sizeof(wchar_t));
+    memcpy(out.data.data(), unescaped.c_str(), (unescaped.size() + 1) * sizeof(wchar_t));
+    return true;
+}
+
+bool splitRegistryPath(const std::wstring& fullPath, HKEY& root, std::wstring& subKey, std::wstring& normalizedRoot) {
+    if (fullPath.empty()) return false;
+
+    size_t delim = fullPath.find(L'\\');
+    std::wstring rootPart = (delim == std::wstring::npos) ? fullPath : fullPath.substr(0, delim);
+    normalizedRoot = toUpperCopy(rootPart);
+
+    if (normalizedRoot == L"HKEY_CURRENT_USER" || normalizedRoot == L"HKCU") {
+        root = HKEY_CURRENT_USER;
+    } else if (normalizedRoot == L"HKEY_CLASSES_ROOT" || normalizedRoot == L"HKCR") {
+        root = HKEY_CLASSES_ROOT;
+    } else if (normalizedRoot == L"HKEY_LOCAL_MACHINE" || normalizedRoot == L"HKLM") {
+        root = HKEY_LOCAL_MACHINE;
+    } else if (normalizedRoot == L"HKEY_USERS" || normalizedRoot == L"HKU") {
+        root = HKEY_USERS;
+    } else if (normalizedRoot == L"HKEY_CURRENT_CONFIG" || normalizedRoot == L"HKCC") {
+        root = HKEY_CURRENT_CONFIG;
+    } else {
+        return false;
+    }
+
+    if (delim == std::wstring::npos) {
+        subKey.clear();
+    } else {
+        subKey = fullPath.substr(delim + 1);
+    }
+
+    return true;
+}
+
+bool cleanupEmptyKey(HKEY root, const std::wstring& subKey) {
+    if (subKey.empty()) return false;
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &hKey) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    DWORD subKeyCount = 0;
+    DWORD valueCount = 0;
+    LONG queryResult = RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &subKeyCount, nullptr, nullptr, &valueCount, nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(hKey);
+    if (queryResult != ERROR_SUCCESS) return false;
+
+    if (subKeyCount == 0 && valueCount == 0) {
+        size_t lastSlash = subKey.find_last_of(L'\\');
+        std::wstring parent = (lastSlash == std::wstring::npos) ? std::wstring() : subKey.substr(0, lastSlash);
+        std::wstring leaf = (lastSlash == std::wstring::npos) ? subKey : subKey.substr(lastSlash + 1);
+        HKEY hParent = nullptr;
+        if (RegOpenKeyExW(root, parent.empty() ? nullptr : parent.c_str(), 0, KEY_WRITE, &hParent) == ERROR_SUCCESS) {
+            RegDeleteKeyW(hParent, leaf.c_str());
+            RegCloseKey(hParent);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool deleteRegistryValue(HKEY root, const std::wstring& subKey, const std::wstring& valueName) {
+    HKEY hKey = nullptr;
+    LONG status = RegOpenKeyExW(root, subKey.empty() ? nullptr : subKey.c_str(), 0,
+                                KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &hKey);
+    if (status != ERROR_SUCCESS) {
+        return false;
+    }
+
+    status = RegDeleteValueW(hKey, valueName.empty() ? nullptr : valueName.c_str());
+    RegCloseKey(hKey);
+    if (status != ERROR_SUCCESS) {
+        return false;
+    }
+
+    cleanupEmptyKey(root, subKey);
+    return true;
+}
+
+} // namespace
 
 /*
  * Enhanced Context Detection System
@@ -330,48 +658,21 @@ static void ExtractPathsFromDataObject(IDataObject* pdo, std::vector<std::wstrin
  * - If selection provided: Use parent folder of first selected item
  * - Store both directory context and selection for menu filtering
  *
- * This method sets up m_contextDir and m_selection which are used throughout
+ * This method captures a ContextSnapshot which is used throughout
  * the menu building and command execution process.
  */
 IFACEMETHODIMP AwesomeMenuHost::Initialize(PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pdtobj, HKEY) {
     try {
-        // Clear previous context state
-        m_selection.clear();
-        m_contextDir.clear();
+        m_context = buildContextSnapshot(pidlFolder, pdtobj);
+        m_context.kind = detectContextKind(m_context);
 
-        // Extract context directory from folder PIDL (for background clicks)
-        if (pidlFolder) {
-            wchar_t path[MAX_PATH];
-            if (SHGetPathFromIDListW(pidlFolder, path)) {
-                m_contextDir = path;          // Store folder being viewed
-            }
-        }
-
-        // Extract selected files/folders from data object
-        ExtractPathsFromDataObject(pdtobj, m_selection);
-
-        // If no context directory but we have selections, use parent of first selection
-        if (m_contextDir.empty() && !m_selection.empty()) {
-            std::wstring firstPath = m_selection.front();
-
-            // SECURITY: Ensure path length is reasonable
-            if (firstPath.length() < MAX_PATH - 1) {
-                wchar_t dir[MAX_PATH] = {0};  // Zero-initialized buffer
-                errno_t result = wcscpy_s(dir, ARRAYSIZE(dir), firstPath.c_str());
-
-                if (result == 0) {            // Only proceed if copy succeeded
-                    PathRemoveFileSpecW(dir); // Remove filename, keep directory
-                    m_contextDir = dir;       // Store parent directory as context
-                }
-            }
-        }
-
-        // Load menu configuration from files or hardcoded structures
         loadConfig();
+
+        auto summary = std::format(L"Initialize captured kind {} with {} selections", static_cast<int>(m_context.kind), m_context.selection.size());
+        logDebug(summary, LogCategory::Context);
         return S_OK;
     } catch (...) {
-        // CRITICAL: Never let C++ exceptions escape from COM interface methods
-        // This would crash the Windows Explorer process
+        logDebug(L"Initialize failed with an unexpected exception", LogCategory::Error);
         return E_FAIL;
     }
 }
@@ -437,54 +738,111 @@ static std::wstring RegReadSz(HKEY hKey, const wchar_t* name) {
  * RESULT: Best of both worlds - reliable core functionality + unlimited extensibility
  */
 void AwesomeMenuHost::loadConfig() {
-    OutputDebugStringW(L"AwesomeMenuHost: loadConfig() starting - HYBRID SYSTEM\n");
+    logDebug(L"loadConfig() starting - HYBRID SYSTEM", LogCategory::Menu);
     m_flyouts.clear();                    // Start with empty menu configuration
+    m_activeFlyouts.clear();
 
     // NOTE: AwesomeMenu will be created dynamically based on context in QueryContextMenu
     // This ensures the menu content changes based on what the user right-clicked
 
-    wchar_t debugMsg[256];
-    wsprintfW(debugMsg, L"AwesomeMenuHost: After AwesomeMenu creation, flyouts count: %Iu\n", m_flyouts.size());
-    OutputDebugStringW(debugMsg);
+    logDebug(std::format(L"After AwesomeMenu creation, flyouts count: {}", m_flyouts.size()), LogCategory::Menu);
 
     // THEN: Add registry files as separate flyouts
     try {
-        OutputDebugStringW(L"AwesomeMenuHost: Loading registry files as separate flyouts...\n");
+        logDebug(L"Loading registry files as separate flyouts...", LogCategory::Registry);
         loadRegistryFilesAsSeparateFlyouts(); // Each .reg file becomes its own flyout
 
-        wsprintfW(debugMsg, L"AwesomeMenuHost: After registry files, total flyouts count: %Iu\n", m_flyouts.size());
-        OutputDebugStringW(debugMsg);
+        logDebug(std::format(L"After registry files, total flyouts count: {}", m_flyouts.size()), LogCategory::Registry);
     } catch (...) {
-        OutputDebugStringW(L"AwesomeMenuHost: Exception in loadRegistryFilesAsSeparateFlyouts\n");
+        logDebug(L"Exception in loadRegistryFilesAsSeparateFlyouts", LogCategory::Error);
         // If registry file loading fails, continue - AwesomeMenu is still available
         // This ensures robustness while maintaining core functionality
     }
 
     // EMERGENCY: Ultimate fallback if AwesomeMenu creation fails
-    if (m_flyouts.empty()) {
-        // Create minimal emergency menu to ensure something always appears
-        Flyout f{};
-        f.name = L"Emergency";
-        f.label = L"Awesome Menu";
-        f.showIn = L"background;directory";
+    // if (m_flyouts.empty()) {
+    //     // Create minimal emergency menu to ensure something always appears
+    //     Flyout f{};
+    //     f.name = L"Emergency";
+    //     f.label = L"Awesome Menu";
+    //     f.showIn = L"background;directory";
 
-        FlyoutItem it{};
-        it.label = L"Open Terminal Here (Admin)";
-        it.command = L"wt.exe";
-        it.workingDir = m_contextDir;
-        it.runAs = true;
+    //     f.items.push_back(FlyoutItem{
+    //         .label = L"Open Terminal Here (Admin)",
+    //         .command = L"wt.exe",
+    //         .args = L"",
+    //         .icon = L"",
+    //         .workingDir = m_context.contextDir,
+    //         .runAs = true,
+    //         .section = L""
+    //     });
+    //     m_flyouts.push_back(std::move(f));
+    // }
+}
 
-        f.items.push_back(it);
-        m_flyouts.push_back(std::move(f));
+ContextSnapshot AwesomeMenuHost::buildContextSnapshot(PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pdtobj) {
+    ContextSnapshot snapshot;
+
+    if (pidlFolder) {
+        wchar_t path[MAX_PATH];
+        if (SHGetPathFromIDListW(pidlFolder, path)) {
+            snapshot.contextDir.assign(path);
+        }
     }
+
+    ExtractPathsFromDataObject(pdtobj, snapshot.selection);
+
+    if (snapshot.contextDir.empty() && !snapshot.selection.empty()) {
+        const std::wstring& firstPath = snapshot.selection.front();
+        if (firstPath.length() < MAX_PATH - 1) {
+            wchar_t dir[MAX_PATH] = {0};
+            if (wcscpy_s(dir, ARRAYSIZE(dir), firstPath.c_str()) == 0) {
+                PathRemoveFileSpecW(dir);
+                snapshot.contextDir.assign(dir);
+            }
+        }
+    }
+
+    return snapshot;
+}
+
+ContextKind AwesomeMenuHost::detectContextKind(const ContextSnapshot& snapshot) const {
+    if (snapshot.hasSelection()) {
+        if (snapshot.selection.size() > 1) {
+            return ContextKind::Multi;
+        }
+
+        const std::wstring& itemPath = snapshot.primarySelection();
+
+        if (PathIsDirectoryW(itemPath.c_str())) {
+            ContextKind locationContext = getLocationContext(itemPath);
+            if (locationContext != ContextKind::Background) {
+                return locationContext;
+            }
+
+            ContextKind driveContext = getDriveTypeContext(itemPath);
+            if (driveContext != ContextKind::Background) {
+                return driveContext;
+            }
+
+            return ContextKind::Directory;
+        }
+
+        return getFileTypeContext(itemPath);
+    }
+
+    if (!snapshot.contextDir.empty()) {
+        ContextKind locationContext = getLocationContext(snapshot.contextDir);
+        if (locationContext != ContextKind::Background) {
+            return locationContext;
+        }
+    }
+
+    return ContextKind::Background;
 }
 
 /*
  * Unlimited Menu Test Generator
- * =============================
- * Creates a comprehensive test menu with 30+ items across multiple sections
- * to verify that IContextMenu3 successfully bypasses Windows' 16-item limit.
- *
  * TEST STRUCTURE:
  * - Admin Tools Section: 8 elevated system utilities
  * - Development Section: 10 development environment tools
@@ -815,100 +1173,89 @@ void AwesomeMenuHost::createCompleteAwesomeMenu() {
  * Creates dynamic AwesomeMenu content based on what the user right-clicked.
  * This enables intelligent tool selection and context-appropriate options.
  */
-void AwesomeMenuHost::createContextAwareAwesomeMenu(ContextKind kind) {
-    OutputDebugStringW(L"AwesomeMenuHost: Creating context-aware AwesomeMenu\n");
+Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& snapshot) {
+    logDebug(L"Creating context-aware AwesomeMenu", LogCategory::Menu);
 
-    // Create root AwesomeMenu flyout
     Flyout awesomeMenu{};
     awesomeMenu.name = L"AwesomeMenu";
     awesomeMenu.label = L"Awesome Menu";
-    awesomeMenu.showIn = L""; // Always show, but content changes based on context
+    awesomeMenu.showIn = L"";
 
-    // Add context-specific items based on what was right-clicked
+    ContextKind kind = snapshot.kind;
+
     switch (kind) {
         case ContextKind::Background:
-        case ContextKind::Directory:
-            // For directories/background - focus on development tools
-            {
-                FlyoutItem cmdHere{};
-                cmdHere.label = L"Command Prompt Here";
-                cmdHere.command = L"cmd.exe";
-                cmdHere.workingDir = L"%DIR%";
-                cmdHere.icon = L"cmd.exe";
-                awesomeMenu.items.push_back(std::move(cmdHere));
+        case ContextKind::Directory: {
+            FlyoutItem cmdHere{};
+            cmdHere.label = L"Command Prompt Here";
+            cmdHere.command = L"cmd.exe";
+            cmdHere.workingDir = L"%DIR%";
+            cmdHere.icon = L"cmd.exe";
+            awesomeMenu.items.push_back(std::move(cmdHere));
 
-                FlyoutItem psHere{};
-                psHere.label = L"PowerShell Here";
-                psHere.command = L"powershell.exe";
-                psHere.workingDir = L"%DIR%";
-                psHere.icon = L"powershell.exe";
-                awesomeMenu.items.push_back(std::move(psHere));
+            FlyoutItem psHere{};
+            psHere.label = L"PowerShell Here";
+            psHere.command = L"powershell.exe";
+            psHere.workingDir = L"%DIR%";
+            psHere.icon = L"powershell.exe";
+            awesomeMenu.items.push_back(std::move(psHere));
 
-                FlyoutItem vsCode{};
-                vsCode.label = L"Open in VS Code";
-                vsCode.command = L"code";
-                vsCode.args = L"\"%DIR%\"";
-                vsCode.workingDir = L"%DIR%";
-                awesomeMenu.items.push_back(std::move(vsCode));
-            }
+            FlyoutItem vsCode{};
+            vsCode.label = L"Open in VS Code";
+            vsCode.command = L"code";
+            vsCode.args = L"\"%DIR%\"";
+            vsCode.workingDir = L"%DIR%";
+            awesomeMenu.items.push_back(std::move(vsCode));
             break;
+        }
 
-        case ContextKind::CodeFile:
-            // For code files - focus on editing and compilation
-            {
-                FlyoutItem editVsCode{};
-                editVsCode.label = L"Edit in VS Code";
-                editVsCode.command = L"code";
-                editVsCode.args = L"\"%SEL%\"";
-                editVsCode.workingDir = L"%DIR%";
-                awesomeMenu.items.push_back(std::move(editVsCode));
+        case ContextKind::CodeFile: {
+            FlyoutItem editVsCode{};
+            editVsCode.label = L"Edit in VS Code";
+            editVsCode.command = L"code";
+            editVsCode.args = L"\"%SEL%\"";
+            editVsCode.workingDir = L"%DIR%";
+            awesomeMenu.items.push_back(std::move(editVsCode));
 
-                FlyoutItem editNotepad{};
-                editNotepad.label = L"Edit in Notepad++";
-                editNotepad.command = L"notepad++.exe";
-                editNotepad.args = L"\"%SEL%\"";
-                editNotepad.workingDir = L"%DIR%";
-                awesomeMenu.items.push_back(std::move(editNotepad));
-            }
+            FlyoutItem editNotepad{};
+            editNotepad.label = L"Edit in Notepad++";
+            editNotepad.command = L"notepad++.exe";
+            editNotepad.args = L"\"%SEL%\"";
+            editNotepad.workingDir = L"%DIR%";
+            awesomeMenu.items.push_back(std::move(editNotepad));
             break;
+        }
 
-        case ContextKind::ImageFile:
-            // For images - focus on viewing and editing
-            {
-                FlyoutItem viewImage{};
-                viewImage.label = L"Open with Paint";
-                viewImage.command = L"mspaint.exe";
-                viewImage.args = L"\"%SEL%\"";
-                awesomeMenu.items.push_back(std::move(viewImage));
-            }
+        case ContextKind::ImageFile: {
+            FlyoutItem viewImage{};
+            viewImage.label = L"Open with Paint";
+            viewImage.command = L"mspaint.exe";
+            viewImage.args = L"\"%SEL%\"";
+            awesomeMenu.items.push_back(std::move(viewImage));
             break;
+        }
 
-        case ContextKind::ArchiveFile:
-            // For archives - focus on extraction
-            {
-                FlyoutItem extract{};
-                extract.label = L"Extract Here";
-                extract.command = L"7z.exe";
-                extract.args = L"x \"%SEL%\" -o\"%DIR%\"";
-                extract.workingDir = L"%DIR%";
-                awesomeMenu.items.push_back(std::move(extract));
-            }
+        case ContextKind::ArchiveFile: {
+            FlyoutItem extract{};
+            extract.label = L"Extract Here";
+            extract.command = L"7z.exe";
+            extract.args = L"x \"%SEL%\" -o\"%DIR%\"";
+            extract.workingDir = L"%DIR%";
+            awesomeMenu.items.push_back(std::move(extract));
             break;
+        }
 
-        default:
-            // Default context - basic tools
-            {
-                FlyoutItem cmdHere{};
-                cmdHere.label = L"Command Prompt Here";
-                cmdHere.command = L"cmd.exe";
-                cmdHere.workingDir = L"%DIR%";
-                cmdHere.icon = L"cmd.exe";
-                awesomeMenu.items.push_back(std::move(cmdHere));
-            }
+        default: {
+            FlyoutItem cmdHere{};
+            cmdHere.label = L"Command Prompt Here";
+            cmdHere.command = L"cmd.exe";
+            cmdHere.workingDir = L"%DIR%";
+            cmdHere.icon = L"cmd.exe";
+            awesomeMenu.items.push_back(std::move(cmdHere));
             break;
+        }
     }
 
-    // Always add admin submenu for elevated operations
     Flyout asAdminSubmenu{};
     asAdminSubmenu.name = L"AsAdmin";
     asAdminSubmenu.label = L"As Admin";
@@ -931,12 +1278,79 @@ void AwesomeMenuHost::createContextAwareAwesomeMenu(ContextKind kind) {
 
     awesomeMenu.subFlyouts.push_back(std::move(asAdminSubmenu));
 
-    // Add the context-aware AwesomeMenu to our flyouts
-    m_flyouts.push_back(std::move(awesomeMenu));
+    auto summary = std::format(L"Context-aware menu built for kind {} with {} direct items", static_cast<int>(kind), awesomeMenu.items.size());
+    logDebug(summary, LogCategory::Menu);
 
-    wchar_t debugMsg[256];
-    wsprintfW(debugMsg, L"AwesomeMenuHost: Created context-aware menu for kind %d with %Iu items\n", (int)kind, awesomeMenu.items.size());
-    OutputDebugStringW(debugMsg);
+    return awesomeMenu;
+}
+
+UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hMenu, UINT indexMenu, UINT idCmdFirst, UINT uFlags) {
+    UNREFERENCED_PARAMETER(indexMenu);
+    UNREFERENCED_PARAMETER(uFlags);
+
+    std::vector<Flyout> activeFlyouts = m_flyouts;
+    Flyout contextAware = createContextAwareAwesomeMenu(snapshot);
+    activeFlyouts.insert(activeFlyouts.begin(), std::move(contextAware));
+    m_activeFlyouts = std::move(activeFlyouts);
+
+    UINT idNext = idCmdFirst;
+    m_idCmdFirst = idCmdFirst;
+    m_idToPath.clear();
+
+    auto containsCase = [](const std::wstring& hay, const wchar_t* needle) {
+        if (hay.empty() || !needle) return false;
+        std::wstring h = hay;
+        for (auto& ch : h) ch = towlower(ch);
+        std::wstring n = needle;
+        for (auto& ch : n) ch = towlower(ch);
+        return h.find(n) != std::wstring::npos;
+    };
+
+    auto matchShowIn = [&](const std::wstring& show) {
+        if (show.empty()) return true;
+
+        switch (snapshot.kind) {
+            case ContextKind::Background: return containsCase(show, L"background");
+            case ContextKind::Directory: return containsCase(show, L"directory");
+            case ContextKind::File: return containsCase(show, L"file");
+            case ContextKind::Multi: return containsCase(show, L"multi");
+
+            case ContextKind::TextFile: return containsCase(show, L"text") || containsCase(show, L"file");
+            case ContextKind::ImageFile: return containsCase(show, L"image") || containsCase(show, L"file");
+            case ContextKind::ExecutableFile: return containsCase(show, L"executable") || containsCase(show, L"file");
+            case ContextKind::ArchiveFile: return containsCase(show, L"archive") || containsCase(show, L"file");
+            case ContextKind::DocumentFile: return containsCase(show, L"document") || containsCase(show, L"file");
+            case ContextKind::CodeFile: return containsCase(show, L"code") || containsCase(show, L"file");
+            case ContextKind::MediaFile: return containsCase(show, L"media") || containsCase(show, L"file");
+
+            case ContextKind::HardDrive: return containsCase(show, L"drive") || containsCase(show, L"harddrive");
+            case ContextKind::RemovableDrive: return containsCase(show, L"drive") || containsCase(show, L"removable");
+            case ContextKind::NetworkDrive: return containsCase(show, L"drive") || containsCase(show, L"network");
+            case ContextKind::OpticalDrive: return containsCase(show, L"drive") || containsCase(show, L"optical");
+
+            case ContextKind::DesktopLocation: return containsCase(show, L"desktop") || containsCase(show, L"background");
+            case ContextKind::DocumentsLocation: return containsCase(show, L"documents") || containsCase(show, L"directory");
+            case ContextKind::SystemLocation: return containsCase(show, L"system") || containsCase(show, L"directory");
+            case ContextKind::ProjectLocation: return containsCase(show, L"project") || containsCase(show, L"directory");
+        }
+
+        return true;
+    };
+
+    for (size_t f = 0; f < m_activeFlyouts.size(); ++f) {
+        const auto& fly = m_activeFlyouts[f];
+        if (!matchShowIn(fly.showIn)) {
+            continue;
+        }
+
+        std::vector<UINT> rootPath = { static_cast<UINT>(f) };
+        buildCascadingMenuFixed(hMenu, fly, idNext, rootPath, idCmdFirst);
+    }
+
+    UINT used = idNext - idCmdFirst;
+    auto summary = std::format(L"buildContextMenu produced {} flyouts and {} command IDs", m_activeFlyouts.size(), used);
+    logDebug(summary, LogCategory::Menu);
+    return used;
 }
 
 /*
@@ -988,58 +1402,6 @@ std::wstring AwesomeMenuHost::getMenusFolder() const {
  * - Continues loading other files if one fails
  * - Falls back to hardcoded menus if no files found
  */
-void AwesomeMenuHost::loadFromRegistryFiles() {
-    std::wstring menusFolder = getMenusFolder();
-    if (menusFolder.empty()) return;          // Can't determine AppData path
-
-    // Check if menus folder exists, create if necessary
-    DWORD attrs = GetFileAttributesW(menusFolder.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        // Folder doesn't exist, try to create it for first-run setup
-        if (!CreateDirectoryW(menusFolder.c_str(), nullptr)) {
-            return;                           // Can't create folder, abandon file loading
-        }
-    }
-
-    // Enumerate all .reg files in the menus folder
-    std::wstring searchPattern = menusFolder + L"\\*.reg";
-    WIN32_FIND_DATAW findData;
-    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
-
-    if (hFind == INVALID_HANDLE_VALUE) {
-        return;                               // No .reg files found
-    }
-
-    // Process each .reg file found
-    do {
-        // Skip directories, process only files
-        if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            std::wstring fileName = findData.cFileName;
-            std::wstring fullPath = menusFolder + L"\\" + fileName;
-
-            // Create a flyout structure for this registry file
-            Flyout flyout{};
-            flyout.name = fileName.substr(0, fileName.find_last_of(L'.')); // Remove .reg extension
-            flyout.label = flyout.name;       // Use filename as display label
-            flyout.showIn = L"background;directory;file"; // Show in all contexts by default
-
-            // Parse the registry file and populate flyout structure
-            try {
-                parseRegistryFile(fullPath, flyout);
-                // Only add flyout if it contains actual menu items or submenus
-                if (!flyout.items.empty() || !flyout.subFlyouts.empty()) {
-                    m_flyouts.push_back(std::move(flyout));
-                }
-            } catch (...) {
-                // Skip files that fail to parse, continue with others
-                // This ensures robustness if user has malformed .reg files
-            }
-        }
-    } while (FindNextFileW(hFind, &findData));
-
-    FindClose(hFind);                         // Clean up file enumeration handle
-}
-
 /*
  * Registry Files as Separate Flyouts System
  * ==========================================
@@ -1065,43 +1427,46 @@ void AwesomeMenuHost::loadRegistryFilesAsSeparateFlyouts() {
         }
     }
 
-    // Enumerate all .reg files in the menus folder
+    std::set<std::wstring> currentFiles;
+
     std::wstring searchPattern = menusFolder + L"\\*.reg";
     WIN32_FIND_DATAW findData;
     HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
 
-    if (hFind == INVALID_HANDLE_VALUE) {
-        return;                               // No .reg files found
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::wstring fileName = findData.cFileName;
+                std::wstring fullPath = menusFolder + L"\\" + fileName;
+                currentFiles.insert(fileName);
+
+                removeManagedEntriesForFile(fileName);
+
+                std::vector<std::pair<std::wstring, std::wstring>> appliedEntries;
+                if (applyRegistryFile(fullPath, fileName, appliedEntries)) {
+                    storeManagedRegistryEntries(fileName, appliedEntries);
+
+                    Flyout flyout{};
+                    flyout.name = fileName.substr(0, fileName.find_last_of(L'.'));
+                    flyout.label = flyout.name;
+                    flyout.showIn = L"background;directory;file";
+
+                    try {
+                        parseRegistryFileSimplified(fullPath, flyout);
+                        if (!flyout.items.empty() || !flyout.subFlyouts.empty()) {
+                            m_flyouts.push_back(std::move(flyout));
+                        }
+                    } catch (...) {
+                        logDebug(std::format(L"Failed to parse registry file {}", fileName), LogCategory::Error);
+                    }
+                }
+            }
+        } while (FindNextFileW(hFind, &findData));
+
+        FindClose(hFind);
     }
 
-    // Process each .reg file as a separate flyout
-    do {
-        // Skip directories, process only files
-        if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            std::wstring fileName = findData.cFileName;
-            std::wstring fullPath = menusFolder + L"\\" + fileName;
-
-            // Create a separate flyout for this registry file
-            Flyout flyout{};
-            flyout.name = fileName.substr(0, fileName.find_last_of(L'.')); // Remove .reg extension
-            flyout.label = flyout.name;       // Use filename as display label
-            flyout.showIn = L"background;directory;file"; // Show in all contexts by default
-
-            // Parse the registry file with simplified approach
-            try {
-                parseRegistryFileSimplified(fullPath, flyout);
-                // Only add flyout if it contains actual menu items
-                if (!flyout.items.empty() || !flyout.subFlyouts.empty()) {
-                    m_flyouts.push_back(std::move(flyout));
-                }
-            } catch (...) {
-                // Skip files that fail to parse, continue with others
-                // This ensures robustness if user has malformed .reg files
-            }
-        }
-    } while (FindNextFileW(hFind, &findData));
-
-    FindClose(hFind);                         // Clean up file enumeration handle
+    purgeMissingRegistryFiles(currentFiles);
 }
 
 /*
@@ -1586,11 +1951,11 @@ bool AwesomeMenuHost::expandPlaceholders(std::wstring& s) const {
     };
 
     // Replace placeholders with actual values
-    if (!m_selection.empty()) {
-        replaceAll(L"%SEL%", m_selection.front()); // First selected item
+    if (m_context.hasSelection()) {
+        replaceAll(L"%SEL%", m_context.primarySelection());
     }
-    if (!m_contextDir.empty()) {
-        replaceAll(L"%DIR%", m_contextDir);        // Context directory
+    if (!m_context.contextDir.empty()) {
+        replaceAll(L"%DIR%", m_context.contextDir);
     }
 
     return true;
@@ -1622,7 +1987,7 @@ HRESULT AwesomeMenuHost::runItem(const FlyoutItem& it) const {
     // Prepare execution parameters
     std::wstring exe = it.command;
     std::wstring args = it.args;
-    std::wstring wdir = it.workingDir.empty() ? m_contextDir : it.workingDir;
+    std::wstring wdir = it.workingDir.empty() ? m_context.contextDir : it.workingDir;
 
     // Expand dynamic placeholders with current context
     expandPlaceholders(args);                 // Replace %DIR%, %SEL% in arguments
@@ -1679,119 +2044,17 @@ HRESULT AwesomeMenuHost::runItem(const FlyoutItem& it) const {
  */
 IFACEMETHODIMP AwesomeMenuHost::QueryContextMenu(HMENU hMenu, UINT indexMenu, UINT idCmdFirst, UINT, UINT uFlags) {
     try {
-        // === ENHANCED CONTEXT DETERMINATION ===
-        // Analyze what the user right-clicked on to determine appropriate menus
-        ContextKind kind = ContextKind::Background;     // Default: background click
-
-        if (!m_selection.empty()) {
-            if (m_selection.size() > 1) {
-                kind = ContextKind::Multi;              // Multiple items selected
-            } else {
-                // Single item: enhanced analysis
-                const std::wstring& itemPath = m_selection.front();
-
-                if (PathIsDirectoryW(itemPath.c_str())) {
-                    // Check for special directory contexts
-                    ContextKind locationContext = getLocationContext(itemPath);
-                    if (locationContext != ContextKind::Background) {
-                        kind = locationContext;         // Special location (Desktop, Documents, etc.)
-                    } else {
-                        // Check if it's a drive root
-                        ContextKind driveContext = getDriveTypeContext(itemPath);
-                        if (driveContext != ContextKind::Background) {
-                            kind = driveContext;        // Drive type (Hard, Removable, Network, etc.)
-                        } else {
-                            kind = ContextKind::Directory; // Regular directory
-                        }
-                    }
-                } else {
-                    // File: determine type by extension
-                    kind = getFileTypeContext(itemPath);
-                }
-            }
-        } else {
-            // Background click: check for special location context
-            ContextKind locationContext = getLocationContext(m_contextDir);
-            if (locationContext != ContextKind::Background) {
-                kind = locationContext;
-            }
+        if (uFlags & CMF_DEFAULTONLY) {
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        // === CONTEXT-AWARE AWESOMEMENU CREATION ===
-        // Create AwesomeMenu based on the detected context
-        wchar_t contextMsg[256];
-        wsprintfW(contextMsg, L"AwesomeMenuHost: Creating context-aware AwesomeMenu for context kind: %d\n", (int)kind);
-        OutputDebugStringW(contextMsg);
-        createContextAwareAwesomeMenu(kind);
+        ContextSnapshot snapshot = m_context;
+        snapshot.kind = detectContextKind(snapshot);
 
-        // === MENU ID MANAGEMENT ===
-        // Set up command ID tracking for menu item execution
-        UINT idNext = idCmdFirst;
-        m_idCmdFirst = idCmdFirst;                      // Store base ID for relative calculations
-        m_idToPath.clear();                             // Clear previous ID mappings
-
-        // === CONTEXT FILTERING HELPERS ===
-        // Case-insensitive string search for showIn filtering
-        auto containsCase = [](const std::wstring& hay, const wchar_t* needle) {
-            if (hay.empty() || !needle) return false;
-            std::wstring h = hay; for (auto& ch : h) ch = towlower(ch);
-            std::wstring n = needle; for (auto& ch : n) ch = towlower(ch);
-            return h.find(n) != std::wstring::npos;
-        };
-
-        // Determine if a flyout should be shown in current context
-        auto matchShowIn = [&](const std::wstring& show) {
-            if (show.empty()) return true;              // Default: show everywhere
-
-            switch (kind) {
-                // Basic contexts
-                case ContextKind::Background: return containsCase(show, L"background");
-                case ContextKind::Directory:  return containsCase(show, L"directory");
-                case ContextKind::File:       return containsCase(show, L"file");
-                case ContextKind::Multi:      return containsCase(show, L"multi");
-
-                // File type contexts
-                case ContextKind::TextFile:      return containsCase(show, L"text") || containsCase(show, L"file");
-                case ContextKind::ImageFile:     return containsCase(show, L"image") || containsCase(show, L"file");
-                case ContextKind::ExecutableFile: return containsCase(show, L"executable") || containsCase(show, L"file");
-                case ContextKind::ArchiveFile:   return containsCase(show, L"archive") || containsCase(show, L"file");
-                case ContextKind::DocumentFile:  return containsCase(show, L"document") || containsCase(show, L"file");
-                case ContextKind::CodeFile:      return containsCase(show, L"code") || containsCase(show, L"file");
-                case ContextKind::MediaFile:     return containsCase(show, L"media") || containsCase(show, L"file");
-
-                // Drive type contexts
-                case ContextKind::HardDrive:     return containsCase(show, L"drive") || containsCase(show, L"harddrive");
-                case ContextKind::RemovableDrive: return containsCase(show, L"drive") || containsCase(show, L"removable");
-                case ContextKind::NetworkDrive:  return containsCase(show, L"drive") || containsCase(show, L"network");
-                case ContextKind::OpticalDrive:  return containsCase(show, L"drive") || containsCase(show, L"optical");
-
-                // Special location contexts
-                case ContextKind::DesktopLocation:   return containsCase(show, L"desktop") || containsCase(show, L"background");
-                case ContextKind::DocumentsLocation: return containsCase(show, L"documents") || containsCase(show, L"directory");
-                case ContextKind::SystemLocation:    return containsCase(show, L"system") || containsCase(show, L"directory");
-                case ContextKind::ProjectLocation:   return containsCase(show, L"project") || containsCase(show, L"directory");
-            }
-            return true;
-        };
-
-        // === UNLIMITED MENU BUILDING ===
-        // Build cascading menus for each flyout with FIXED ID mapping
-        // This is where we bypass Windows' 16-item limit!
-        for (size_t f = 0; f < m_flyouts.size(); ++f) {
-            const auto& fly = m_flyouts[f];
-
-            // Skip flyouts that don't match current context
-            if (!matchShowIn(fly.showIn)) continue;
-
-            // Create path for this flyout and build its menu tree
-            std::vector<UINT> rootPath = { (UINT)f };
-            buildCascadingMenuFixed(hMenu, fly, idNext, rootPath, idCmdFirst);
-        }
-
-        // Return success with count of command IDs used
-        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, static_cast<USHORT>((idNext - idCmdFirst)));
+        UINT used = buildContextMenu(snapshot, hMenu, indexMenu, idCmdFirst, uFlags);
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, static_cast<USHORT>(used));
     } catch (...) {
-        // CRITICAL: Never let C++ exceptions escape from COM interface methods
+        logDebug(L"QueryContextMenu failed with an unexpected exception", LogCategory::Error);
         return E_FAIL;
     }
 }
@@ -1937,8 +2200,8 @@ UINT AwesomeMenuHost::buildCascadingMenu(HMENU hParentMenu, const Flyout& flyout
         itemPath.push_back(0); // 0 = item (not subflyout)
 
         // DEBUG: Show what ID we're storing
-        std::wstring storeMsg = L"STORING: ID=" + std::to_wstring(mi.wID) + L" for item: " + item.label;
-        OutputDebugStringW(storeMsg.c_str());
+    std::wstring storeMsg = L"STORING: ID=" + std::to_wstring(mi.wID) + L" for item: " + item.label;
+    logDebug(storeMsg, LogCategory::Menu);
 
         m_idToPath[mi.wID] = itemPath; // Store using the actual menu ID!
         idNext++;
@@ -2124,12 +2387,14 @@ const FlyoutItem* AwesomeMenuHost::findItemByPath(const std::vector<UINT>& path)
     // Validate minimum path length (flyout + item + type)
     if (path.size() < 3) return nullptr;
 
+    const auto& source = m_activeFlyouts.empty() ? m_flyouts : m_activeFlyouts;
+
     // Extract root flyout index
     UINT flyoutIdx = path[0];
-    if (flyoutIdx >= m_flyouts.size()) return nullptr;
+    if (flyoutIdx >= source.size()) return nullptr;
 
     // Start navigation at root flyout
-    const Flyout* currentFlyout = &m_flyouts[flyoutIdx];
+    const Flyout* currentFlyout = &source[flyoutIdx];
 
     // Navigate through the path to find the target item
     // Process path segments in pairs: [index, type]
@@ -2194,4 +2459,206 @@ HBITMAP AwesomeMenuHost::hbitmapFromIconSpec(const std::wstring& spec, int sizeP
     DestroyIcon(hIcon);
 
     return hBitmap;
+}
+
+bool AwesomeMenuHost::applyRegistryFile(const std::wstring& fullPath, const std::wstring& fileKey,
+                                        std::vector<std::pair<std::wstring, std::wstring>>& recordedEntries) {
+    recordedEntries.clear();
+
+    std::wifstream file(fullPath);
+    if (!file.is_open()) {
+        logDebug(std::format(L"Unable to open registry file {}", fullPath), LogCategory::Error);
+        return false;
+    }
+
+    std::wstring line;
+    std::wstring currentKey;
+
+    while (std::getline(file, line)) {
+        if (!line.empty() && line[0] == 0xFEFF) {
+            line.erase(line.begin());
+        }
+        trimInPlace(line);
+        if (line.empty()) continue;
+        if (line[0] == L';' || line[0] == L'#') continue;
+
+        if (line.front() == L'[' && line.back() == L']') {
+            currentKey = line.substr(1, line.size() - 2);
+            trimInPlace(currentKey);
+            continue;
+        }
+
+        size_t equals = line.find(L'=');
+        if (equals == std::wstring::npos) {
+            continue;
+        }
+
+        if (currentKey.empty()) {
+            logDebug(std::format(L"Value encountered without key in {}", fullPath), LogCategory::Registry);
+            continue;
+        }
+
+        std::wstring valueName = line.substr(0, equals);
+        trimInPlace(valueName);
+        if (valueName == L"@") {
+            valueName.clear();
+        } else if (valueName.size() >= 2 && valueName.front() == L'"' && valueName.back() == L'"') {
+            valueName = valueName.substr(1, valueName.size() - 2);
+        }
+
+        std::wstring valueData = line.substr(equals + 1);
+        trimInPlace(valueData);
+
+        while (!valueData.empty() && valueData.back() == L'\\') {
+            valueData.pop_back();
+            trimInPlace(valueData);
+            std::wstring continuation;
+            if (!std::getline(file, continuation)) {
+                break;
+            }
+            if (!continuation.empty() && continuation[0] == 0xFEFF) {
+                continuation.erase(continuation.begin());
+            }
+            trimInPlace(continuation);
+            valueData += continuation;
+        }
+
+        ParsedRegValue parsed;
+        if (!parseRegistryValueData(valueData, parsed)) {
+            logDebug(std::format(L"Unsupported registry value '{}' in file {}", line, fullPath), LogCategory::Registry);
+            continue;
+        }
+
+        HKEY rootKey{};
+        std::wstring subKey;
+        std::wstring normalizedRoot;
+        if (!splitRegistryPath(currentKey, rootKey, subKey, normalizedRoot)) {
+            logDebug(std::format(L"Unsupported registry hive '{}' in file {}", currentKey, fullPath), LogCategory::Registry);
+            continue;
+        }
+
+        if (parsed.type == REG_NONE && parsed.data.empty() && valueData == L"-") {
+            if (!deleteRegistryValue(rootKey, subKey, valueName)) {
+                logDebug(std::format(L"Failed to delete registry value '{}' in '{}'", valueName, currentKey), LogCategory::Registry);
+            }
+            continue;
+        }
+
+        HKEY hKey = nullptr;
+        LONG status = RegCreateKeyExW(rootKey, subKey.empty() ? nullptr : subKey.c_str(), 0, nullptr, 0,
+                                      KEY_SET_VALUE, nullptr, &hKey, nullptr);
+        if (status != ERROR_SUCCESS) {
+            logDebug(std::format(L"Failed to open registry key '{}' (error {})", currentKey, status), LogCategory::Registry);
+            continue;
+        }
+
+        status = RegSetValueExW(hKey, valueName.empty() ? nullptr : valueName.c_str(), 0, parsed.type,
+                                parsed.data.empty() ? nullptr : parsed.data.data(),
+                                static_cast<DWORD>(parsed.data.size()));
+        RegCloseKey(hKey);
+
+        if (status != ERROR_SUCCESS) {
+            logDebug(std::format(L"Failed to set registry value '{}' in '{}' (error {})", valueName, currentKey, status), LogCategory::Registry);
+            continue;
+        }
+
+        std::wstring recordedKey = normalizedRoot;
+        if (!subKey.empty()) {
+            recordedKey += L"\\" + subKey;
+        }
+        recordedEntries.emplace_back(std::move(recordedKey), valueName);
+    }
+
+    return true;
+}
+
+void AwesomeMenuHost::storeManagedRegistryEntries(const std::wstring& fileKey,
+                                     const std::vector<std::pair<std::wstring, std::wstring>>& entries) {
+    HKEY root = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kManagedRegistryRoot, 0, nullptr, 0, KEY_WRITE, nullptr, &root, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+
+    HKEY fileNode = nullptr;
+    if (RegCreateKeyExW(root, fileKey.c_str(), 0, nullptr, 0, KEY_WRITE, nullptr, &fileNode, nullptr) == ERROR_SUCCESS) {
+        std::vector<std::wstring> flattened;
+        flattened.reserve(entries.size());
+        for (const auto& entry : entries) {
+            flattened.push_back(entry.first + L"|" + entry.second);
+        }
+        std::vector<wchar_t> multi = vectorToMultiSz(flattened);
+        RegSetValueExW(fileNode, L"Entries", 0, REG_MULTI_SZ,
+                       reinterpret_cast<const BYTE*>(multi.data()),
+                       static_cast<DWORD>(multi.size() * sizeof(wchar_t)));
+        RegCloseKey(fileNode);
+    }
+
+    RegCloseKey(root);
+}
+
+void AwesomeMenuHost::removeManagedEntriesForFile(const std::wstring& fileKey) {
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kManagedRegistryRoot, 0, KEY_READ | KEY_WRITE, &root) != ERROR_SUCCESS) {
+        return;
+    }
+
+    HKEY fileNode = nullptr;
+    if (RegOpenKeyExW(root, fileKey.c_str(), 0, KEY_READ | KEY_WRITE, &fileNode) == ERROR_SUCCESS) {
+        DWORD type = 0;
+        DWORD dataSize = 0;
+        if (RegQueryValueExW(fileNode, L"Entries", nullptr, &type, nullptr, &dataSize) == ERROR_SUCCESS && type == REG_MULTI_SZ && dataSize > sizeof(wchar_t)) {
+            std::vector<wchar_t> buffer(dataSize / sizeof(wchar_t));
+            if (RegQueryValueExW(fileNode, L"Entries", nullptr, &type,
+                                 reinterpret_cast<LPBYTE>(buffer.data()), &dataSize) == ERROR_SUCCESS) {
+                auto entries = multiSzToVector(buffer.data(), buffer.size());
+                for (const auto& entry : entries) {
+                    size_t pipe = entry.find(L'|');
+                    std::wstring keyPath = (pipe == std::wstring::npos) ? entry : entry.substr(0, pipe);
+                    std::wstring valueName = (pipe == std::wstring::npos) ? std::wstring() : entry.substr(pipe + 1);
+
+                    HKEY rootKey{};
+                    std::wstring subKey;
+                    std::wstring normalized;
+                    if (splitRegistryPath(keyPath, rootKey, subKey, normalized)) {
+                        deleteRegistryValue(rootKey, subKey, valueName);
+                    }
+                }
+            }
+        }
+
+        RegCloseKey(fileNode);
+        RegDeleteTreeW(root, fileKey.c_str());
+    }
+
+    RegCloseKey(root);
+}
+
+void AwesomeMenuHost::purgeMissingRegistryFiles(const std::set<std::wstring>& currentFiles) {
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kManagedRegistryRoot, 0, KEY_READ, &root) != ERROR_SUCCESS) {
+        return;
+    }
+
+    std::vector<std::wstring> trackedFiles;
+    DWORD index = 0;
+    wchar_t nameBuffer[256];
+    while (true) {
+        DWORD nameLen = ARRAYSIZE(nameBuffer);
+        LONG status = RegEnumKeyExW(root, index, nameBuffer, &nameLen, nullptr, nullptr, nullptr, nullptr);
+        if (status == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (status == ERROR_SUCCESS) {
+            trackedFiles.emplace_back(nameBuffer, nameLen);
+        }
+        ++index;
+    }
+
+    RegCloseKey(root);
+
+    for (const auto& tracked : trackedFiles) {
+        if (!currentFiles.contains(tracked)) {
+            removeManagedEntriesForFile(tracked);
+        }
+    }
 }

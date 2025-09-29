@@ -1,0 +1,16 @@
+/work_instruction/
+/build/
+/.vscode/
+.claude/
+.vs/
+*.user
+*.suo
+*.opensdf
+*.db
+*.VC.db
+*.pdb
+*.ilk
+*.obj
+*.log
+/New folder/
+*.cache

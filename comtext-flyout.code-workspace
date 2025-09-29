@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.autoSave": "afterDelay",
+		"editor.fontSize": 12
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+
+			
+			{
+				"name": "CMake: CMake Script",
+				"type": "cmake",
+				"request": "launch",
+				"cmakeDebugType": "script",
+				"scriptPath": "${file}"
+			}
+		]
+	}
+}
