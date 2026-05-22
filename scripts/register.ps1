@@ -25,17 +25,8 @@ reg add "HKCU\Software\Classes\CLSID\$guid\InprocServer32" /v ThreadingModel /t 
 # Context menu handlers under HKCU\Software\Classes (per-user only)
 # Using highly selective registration to avoid any overlapping contexts
 reg add "HKCU\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-
-# Register for specific file types instead of * (which conflicts with folder contexts)
-reg add "HKCU\Software\Classes\txtfile\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-reg add "HKCU\Software\Classes\batfile\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-reg add "HKCU\Software\Classes\cmdfile\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-
-# NOTE: Using specific file types instead of * to prevent folder/file context conflicts
-# This should eliminate duplicate menus in navigation pane while maintaining file support
-
-# Note: We only register the COM handler, not direct shell entries
-# AwesomeMenuHost will read from the existing AwesomeMenu registry structure
+reg add "HKCU\Software\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
+reg add "HKCU\Software\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
 
 Write-Host "Registered AwesomeMenuHost per-user." -ForegroundColor Green
 Write-Host "Restarting Explorer..." -ForegroundColor Yellow
