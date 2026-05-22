@@ -145,6 +145,7 @@ enum class LogCategory {
 struct ContextSnapshot {
     ContextKind kind = ContextKind::Background;
     std::wstring contextDir;
+    std::wstring selectedExt;  // lowercase extension without dot (e.g. "py", "cpp"); empty for dirs/multi
     std::vector<std::wstring> selection;
 
     bool hasSelection() const noexcept { return !selection.empty(); }

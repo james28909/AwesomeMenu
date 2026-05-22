@@ -402,86 +402,156 @@ struct ToolPaths {
     std::wstring code;         // VS Code
     std::wstring cursor;       // Cursor
     std::wstring zed;          // Zed
+    std::wstring sublimeText;  // Sublime Text
     std::wstring devenv;       // Visual Studio 2022 IDE
     std::wstring vs2022Root;   // VS 2022 install root (for dev shells)
     std::wstring git;          // Git
     std::wstring gitBash;      // Git Bash
     std::wstring notepadPP;    // Notepad++
     std::wstring sevenZip;     // 7-Zip
+    std::wstring python;       // Python interpreter
+    std::wstring node;         // Node.js
+    std::wstring pycharm;      // PyCharm (JetBrains)
+    std::wstring rider;        // Rider (JetBrains)
+    std::wstring webStorm;     // WebStorm (JetBrains)
+    std::wstring clion;        // CLion (JetBrains)
+    std::wstring vlc;          // VLC media player
+    std::wstring winMerge;     // WinMerge diff tool
 };
 
 static ToolPaths detectTools() {
-    ToolPaths t;
+    // Cache result — detection only runs once per DLL lifetime
+    static ToolPaths s_cached = []() -> ToolPaths {
+        ToolPaths t;
 
-    std::wstring local  = getKnownFolder(FOLDERID_LocalAppData);
-    std::wstring pf     = getKnownFolder(FOLDERID_ProgramFiles);
-    std::wstring pfx86  = getKnownFolder(FOLDERID_ProgramFilesX86);
+        std::wstring local  = getKnownFolder(FOLDERID_LocalAppData);
+        std::wstring pf     = getKnownFolder(FOLDERID_ProgramFiles);
+        std::wstring pfx86  = getKnownFolder(FOLDERID_ProgramFilesX86);
 
-    auto tryPath = [](std::wstring& dest, const std::wstring& path) {
-        if (dest.empty() && pathExists(path.c_str()))
-            dest = path;
-    };
+        auto tryPath = [](std::wstring& dest, const std::wstring& path) {
+            if (dest.empty() && pathExists(path.c_str()))
+                dest = path;
+        };
 
-    // Windows Terminal
-    t.wt = findOnPath(L"wt.exe");
+        // Windows Terminal
+        t.wt = findOnPath(L"wt.exe");
 
-    // PowerShell 7
-    t.pwsh = findOnPath(L"pwsh.exe");
-    if (!pf.empty()) tryPath(t.pwsh, pf + L"\\PowerShell\\7\\pwsh.exe");
+        // PowerShell 7
+        t.pwsh = findOnPath(L"pwsh.exe");
+        if (!pf.empty()) tryPath(t.pwsh, pf + L"\\PowerShell\\7\\pwsh.exe");
 
-    // VS Code Insiders
-    t.codeInsiders = findOnPath(L"code-insiders.exe");
-    if (!local.empty()) tryPath(t.codeInsiders, local + L"\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe");
+        // VS Code Insiders
+        t.codeInsiders = findOnPath(L"code-insiders.exe");
+        if (!local.empty()) tryPath(t.codeInsiders, local + L"\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe");
 
-    // VS Code
-    t.code = findOnPath(L"code.exe");
-    if (!local.empty()) tryPath(t.code, local + L"\\Programs\\Microsoft VS Code\\Code.exe");
+        // VS Code
+        t.code = findOnPath(L"code.exe");
+        if (!local.empty()) tryPath(t.code, local + L"\\Programs\\Microsoft VS Code\\Code.exe");
 
-    // Cursor
-    t.cursor = findOnPath(L"cursor.exe");
-    if (!local.empty()) {
-        tryPath(t.cursor, local + L"\\Programs\\cursor\\Cursor.exe");
-        tryPath(t.cursor, local + L"\\Programs\\Cursor\\Cursor.exe");
-    }
+        // Cursor
+        t.cursor = findOnPath(L"cursor.exe");
+        if (!local.empty()) {
+            tryPath(t.cursor, local + L"\\Programs\\cursor\\Cursor.exe");
+            tryPath(t.cursor, local + L"\\Programs\\Cursor\\Cursor.exe");
+        }
 
-    // Zed
-    t.zed = findOnPath(L"zed.exe");
-    if (!local.empty()) tryPath(t.zed, local + L"\\Programs\\Zed\\zed.exe");
+        // Zed
+        t.zed = findOnPath(L"zed.exe");
+        if (t.zed.empty() && !local.empty()) {
+            tryPath(t.zed, local + L"\\Programs\\Zed\\bin\\zed.exe");
+            tryPath(t.zed, local + L"\\Programs\\Zed\\zed.exe");
+        }
 
-    // Git
-    t.git = findOnPath(L"git.exe");
-    if (!pf.empty())   tryPath(t.git, pf   + L"\\Git\\bin\\git.exe");
-    if (!pfx86.empty()) tryPath(t.git, pfx86 + L"\\Git\\bin\\git.exe");
+        // Sublime Text
+        t.sublimeText = findOnPath(L"subl.exe");
+        if (t.sublimeText.empty()) {
+            if (!pf.empty())    tryPath(t.sublimeText, pf    + L"\\Sublime Text\\subl.exe");
+            if (!pfx86.empty()) tryPath(t.sublimeText, pfx86 + L"\\Sublime Text\\subl.exe");
+            if (!pf.empty())    tryPath(t.sublimeText, pf    + L"\\Sublime Text 3\\subl.exe");
+        }
 
-    // Git Bash
-    if (!pf.empty())   tryPath(t.gitBash, pf   + L"\\Git\\git-bash.exe");
-    if (!pfx86.empty()) tryPath(t.gitBash, pfx86 + L"\\Git\\git-bash.exe");
+        // Git
+        t.git = findOnPath(L"git.exe");
+        if (!pf.empty())    tryPath(t.git, pf    + L"\\Git\\bin\\git.exe");
+        if (!pfx86.empty()) tryPath(t.git, pfx86 + L"\\Git\\bin\\git.exe");
 
-    // Notepad++
-    t.notepadPP = findOnPath(L"notepad++.exe");
-    if (!pf.empty())   tryPath(t.notepadPP, pf   + L"\\Notepad++\\notepad++.exe");
-    if (!pfx86.empty()) tryPath(t.notepadPP, pfx86 + L"\\Notepad++\\notepad++.exe");
+        // Git Bash
+        if (!pf.empty())    tryPath(t.gitBash, pf    + L"\\Git\\git-bash.exe");
+        if (!pfx86.empty()) tryPath(t.gitBash, pfx86 + L"\\Git\\git-bash.exe");
 
-    // 7-Zip
-    t.sevenZip = findOnPath(L"7z.exe");
-    if (!pf.empty())   tryPath(t.sevenZip, pf   + L"\\7-Zip\\7z.exe");
-    if (!pfx86.empty()) tryPath(t.sevenZip, pfx86 + L"\\7-Zip\\7z.exe");
+        // Notepad++
+        t.notepadPP = findOnPath(L"notepad++.exe");
+        if (!pf.empty())    tryPath(t.notepadPP, pf    + L"\\Notepad++\\notepad++.exe");
+        if (!pfx86.empty()) tryPath(t.notepadPP, pfx86 + L"\\Notepad++\\notepad++.exe");
 
-    // Visual Studio 2022 (check all editions)
-    if (!pf.empty()) {
-        static const wchar_t* editions[] = { L"Professional", L"Enterprise", L"Community", L"BuildTools" };
-        for (const wchar_t* ed : editions) {
-            std::wstring root   = pf + L"\\Microsoft Visual Studio\\2022\\" + ed;
-            std::wstring devenv = root + L"\\Common7\\IDE\\devenv.exe";
-            if (pathExists(devenv.c_str())) {
-                t.devenv     = devenv;
-                t.vs2022Root = root;
-                break;
+        // 7-Zip
+        t.sevenZip = findOnPath(L"7z.exe");
+        if (!pf.empty())    tryPath(t.sevenZip, pf    + L"\\7-Zip\\7z.exe");
+        if (!pfx86.empty()) tryPath(t.sevenZip, pfx86 + L"\\7-Zip\\7z.exe");
+
+        // Python
+        t.python = findOnPath(L"python.exe");
+        if (t.python.empty()) t.python = findOnPath(L"py.exe");
+        if (t.python.empty() && !local.empty()) {
+            // Common Python Launcher / MS Store install location
+            tryPath(t.python, local + L"\\Programs\\Python\\Launcher\\py.exe");
+        }
+
+        // Node.js
+        t.node = findOnPath(L"node.exe");
+        if (t.node.empty() && !pf.empty())
+            tryPath(t.node, pf + L"\\nodejs\\node.exe");
+
+        // JetBrains Toolbox scripts
+        std::wstring jbScripts = local.empty() ? L"" : (local + L"\\JetBrains\\Toolbox\\scripts");
+
+        // PyCharm
+        t.pycharm = findOnPath(L"pycharm.cmd");
+        if (t.pycharm.empty() && !jbScripts.empty()) tryPath(t.pycharm, jbScripts + L"\\pycharm.cmd");
+
+        // Rider
+        t.rider = findOnPath(L"rider.cmd");
+        if (t.rider.empty() && !jbScripts.empty()) tryPath(t.rider, jbScripts + L"\\rider.cmd");
+
+        // WebStorm
+        t.webStorm = findOnPath(L"webstorm.cmd");
+        if (t.webStorm.empty() && !jbScripts.empty()) tryPath(t.webStorm, jbScripts + L"\\webstorm.cmd");
+
+        // CLion
+        t.clion = findOnPath(L"clion.cmd");
+        if (t.clion.empty() && !jbScripts.empty()) tryPath(t.clion, jbScripts + L"\\clion.cmd");
+
+        // VLC
+        t.vlc = findOnPath(L"vlc.exe");
+        if (t.vlc.empty()) {
+            if (!pf.empty())    tryPath(t.vlc, pf    + L"\\VideoLAN\\VLC\\vlc.exe");
+            if (!pfx86.empty()) tryPath(t.vlc, pfx86 + L"\\VideoLAN\\VLC\\vlc.exe");
+        }
+
+        // WinMerge
+        t.winMerge = findOnPath(L"WinMergeU.exe");
+        if (t.winMerge.empty()) {
+            if (!pf.empty())    tryPath(t.winMerge, pf    + L"\\WinMerge\\WinMergeU.exe");
+            if (!pfx86.empty()) tryPath(t.winMerge, pfx86 + L"\\WinMerge\\WinMergeU.exe");
+        }
+
+        // Visual Studio 2022 (check all editions)
+        if (!pf.empty()) {
+            static const wchar_t* editions[] = { L"Professional", L"Enterprise", L"Community", L"BuildTools" };
+            for (const wchar_t* ed : editions) {
+                std::wstring root   = pf + L"\\Microsoft Visual Studio\\2022\\" + ed;
+                std::wstring devenv = root + L"\\Common7\\IDE\\devenv.exe";
+                if (pathExists(devenv.c_str())) {
+                    t.devenv     = devenv;
+                    t.vs2022Root = root;
+                    break;
+                }
             }
         }
-    }
 
-    return t;
+        return t;
+    }();
+    return s_cached;
 }
 
 } // namespace
@@ -906,7 +976,11 @@ ContextSnapshot AwesomeMenuHost::buildContextSnapshot(PCIDLIST_ABSOLUTE pidlFold
 
     ExtractPathsFromDataObject(pdtobj, snapshot.selection);
 
-    if (snapshot.contextDir.empty() && !snapshot.selection.empty()) {
+    if (snapshot.selection.size() == 1 && PathIsDirectoryW(snapshot.selection.front().c_str())) {
+        // Right-click on a folder icon: use the folder itself as context dir, not its parent
+        snapshot.contextDir = snapshot.selection.front();
+    } else if (snapshot.contextDir.empty() && !snapshot.selection.empty()) {
+        // No pidlFolder: derive context dir from parent of first selection
         const std::wstring& firstPath = snapshot.selection.front();
         if (firstPath.length() < MAX_PATH - 1) {
             wchar_t dir[MAX_PATH] = {0};
@@ -914,6 +988,16 @@ ContextSnapshot AwesomeMenuHost::buildContextSnapshot(PCIDLIST_ABSOLUTE pidlFold
                 PathRemoveFileSpecW(dir);
                 snapshot.contextDir.assign(dir);
             }
+        }
+    }
+
+    // Extract lowercase extension for single file selections (not directories)
+    if (snapshot.selection.size() == 1 && !PathIsDirectoryW(snapshot.selection.front().c_str())) {
+        const std::wstring& path = snapshot.selection.front();
+        size_t dotPos = path.rfind(L'.');
+        if (dotPos != std::wstring::npos && dotPos + 1 < path.size()) {
+            snapshot.selectedExt = path.substr(dotPos + 1);
+            for (auto& ch : snapshot.selectedExt) ch = towlower(ch);
         }
     }
 
@@ -1002,23 +1086,25 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
     if (isFolderCtx || kind == ContextKind::Multi) {
         // === Terminals ===
         if (!tools.wt.empty())
-            addItem(menu, L"Windows Terminal Here", tools.wt,        L"-d \"%DIR%\"",  tools.wt,        false, L"Terminals");
+            addItem(menu, L"Windows Terminal Here", tools.wt,          L"-d \"%DIR%\"", tools.wt,          false, L"Terminals");
         if (!tools.pwsh.empty())
-            addItem(menu, L"PowerShell 7 Here",     tools.pwsh,      L"",              tools.pwsh,      false, L"Terminals");
-        addItem(menu,     L"PowerShell Here",        L"powershell.exe", L"",            L"powershell.exe", false, L"Terminals");
-        addItem(menu,     L"Command Prompt Here",    L"cmd.exe",      L"",              L"cmd.exe",      false, L"Terminals");
+            addItem(menu, L"PowerShell 7 Here",     tools.pwsh,        L"",             tools.pwsh,        false, L"Terminals");
+        addItem(menu,     L"PowerShell Here",        L"powershell.exe", L"",             L"powershell.exe", false, L"Terminals");
+        addItem(menu,     L"Command Prompt Here",    L"cmd.exe",        L"",             L"cmd.exe",        false, L"Terminals");
 
         // === IDEs / Editors ===
         if (!tools.codeInsiders.empty())
-            addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%DIR%\"", tools.codeInsiders, false, L"Editors");
+            addItem(menu, L"Open with VS Code Insiders",  tools.codeInsiders, L"\"%DIR%\"", tools.codeInsiders, false, L"Editors");
         if (!tools.code.empty())
-            addItem(menu, L"Open with VS Code",       tools.code,     L"\"%DIR%\"",     tools.code,     false, L"Editors");
+            addItem(menu, L"Open with VS Code",           tools.code,         L"\"%DIR%\"", tools.code,         false, L"Editors");
         if (!tools.cursor.empty())
-            addItem(menu, L"Open with Cursor",        tools.cursor,   L"\"%DIR%\"",     tools.cursor,   false, L"Editors");
+            addItem(menu, L"Open with Cursor",            tools.cursor,       L"\"%DIR%\"", tools.cursor,       false, L"Editors");
         if (!tools.zed.empty())
-            addItem(menu, L"Open with Zed",           tools.zed,      L"\"%DIR%\"",     tools.zed,      false, L"Editors");
+            addItem(menu, L"Open with Zed",               tools.zed,          L"\"%DIR%\"", tools.zed,          false, L"Editors");
+        if (!tools.sublimeText.empty())
+            addItem(menu, L"Open with Sublime Text",      tools.sublimeText,  L"\"%DIR%\"", tools.sublimeText,  false, L"Editors");
         if (!tools.devenv.empty())
-            addItem(menu, L"Open with Visual Studio 2022", tools.devenv, L"\"%DIR%\"",  tools.devenv,   false, L"Editors");
+            addItem(menu, L"Open with Visual Studio 2022", tools.devenv,      L"\"%DIR%\"", tools.devenv,       false, L"Editors");
 
         // === Git submenu ===
         if (!tools.git.empty() || !tools.gitBash.empty()) {
@@ -1034,7 +1120,7 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
 
         // === VS 2022 Dev Shells submenu ===
         if (!tools.vs2022Root.empty()) {
-            std::wstring vcvarsall = tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvarsall.bat";
+            std::wstring vcvarsall   = tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvarsall.bat";
             std::wstring devShellDll = tools.vs2022Root + L"\\Common7\\Tools\\Microsoft.VisualStudio.DevShell.dll";
 
             if (pathExists(vcvarsall.c_str())) {
@@ -1042,44 +1128,41 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
                 devShells.name  = L"DevShells";
                 devShells.label = L"VS 2022 Dev Shells";
 
-                // x64 CMD
                 FlyoutItem x64cmd{};
-                x64cmd.label     = L"x64 Native Tools CMD";
-                x64cmd.command   = L"cmd.exe";
-                x64cmd.args      = L"/k \"\"" + tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvars64.bat\"\"";
+                x64cmd.label      = L"x64 Native Tools CMD";
+                x64cmd.command    = L"cmd.exe";
+                x64cmd.args       = L"/k \"\"" + tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvars64.bat\"\"";
                 x64cmd.workingDir = L"%DIR%";
-                x64cmd.icon      = L"cmd.exe";
+                x64cmd.icon       = L"cmd.exe";
                 devShells.items.push_back(std::move(x64cmd));
 
-                // x86 CMD
                 FlyoutItem x86cmd{};
-                x86cmd.label     = L"x86 Native Tools CMD";
-                x86cmd.command   = L"cmd.exe";
-                x86cmd.args      = L"/k \"\"" + tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvars32.bat\"\"";
+                x86cmd.label      = L"x86 Native Tools CMD";
+                x86cmd.command    = L"cmd.exe";
+                x86cmd.args       = L"/k \"\"" + tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvars32.bat\"\"";
                 x86cmd.workingDir = L"%DIR%";
-                x86cmd.icon      = L"cmd.exe";
+                x86cmd.icon       = L"cmd.exe";
                 devShells.items.push_back(std::move(x86cmd));
 
-                // x64 PowerShell (uses Enter-VsDevShell if the DLL is available)
                 if (pathExists(devShellDll.c_str())) {
                     FlyoutItem x64ps{};
-                    x64ps.label   = L"x64 Native Tools PowerShell";
-                    x64ps.command = L"powershell.exe";
-                    x64ps.args    = L"-NoExit -Command \"& { Import-Module '" + devShellDll +
-                                    L"'; Enter-VsDevShell -VsInstallPath '" + tools.vs2022Root +
-                                    L"' -DevCmdArguments '-arch=x64' -SkipAutomaticLocation }\"";
+                    x64ps.label      = L"x64 Native Tools PowerShell";
+                    x64ps.command    = L"powershell.exe";
+                    x64ps.args       = L"-NoExit -Command \"& { Import-Module '" + devShellDll +
+                                       L"'; Enter-VsDevShell -VsInstallPath '" + tools.vs2022Root +
+                                       L"' -DevCmdArguments '-arch=x64' -SkipAutomaticLocation }\"";
                     x64ps.workingDir = L"%DIR%";
-                    x64ps.icon    = L"powershell.exe";
+                    x64ps.icon       = L"powershell.exe";
                     devShells.items.push_back(std::move(x64ps));
 
                     FlyoutItem x86ps{};
-                    x86ps.label   = L"x86 Native Tools PowerShell";
-                    x86ps.command = L"powershell.exe";
-                    x86ps.args    = L"-NoExit -Command \"& { Import-Module '" + devShellDll +
-                                    L"'; Enter-VsDevShell -VsInstallPath '" + tools.vs2022Root +
-                                    L"' -DevCmdArguments '-arch=x86' -SkipAutomaticLocation }\"";
+                    x86ps.label      = L"x86 Native Tools PowerShell";
+                    x86ps.command    = L"powershell.exe";
+                    x86ps.args       = L"-NoExit -Command \"& { Import-Module '" + devShellDll +
+                                       L"'; Enter-VsDevShell -VsInstallPath '" + tools.vs2022Root +
+                                       L"' -DevCmdArguments '-arch=x86' -SkipAutomaticLocation }\"";
                     x86ps.workingDir = L"%DIR%";
-                    x86ps.icon    = L"powershell.exe";
+                    x86ps.icon       = L"powershell.exe";
                     devShells.items.push_back(std::move(x86ps));
                 }
 
@@ -1087,38 +1170,70 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
             }
         }
 
+        // === JetBrains IDEs submenu (if any are installed) ===
+        {
+            bool anyJb = !tools.pycharm.empty() || !tools.rider.empty() ||
+                         !tools.webStorm.empty() || !tools.clion.empty();
+            if (anyJb) {
+                Flyout jbMenu{};
+                jbMenu.name  = L"JetBrains";
+                jbMenu.label = L"JetBrains IDEs";
+                if (!tools.pycharm.empty())   addItem(jbMenu, L"Open with PyCharm",   tools.pycharm,   L"\"%DIR%\"");
+                if (!tools.rider.empty())     addItem(jbMenu, L"Open with Rider",     tools.rider,     L"\"%DIR%\"");
+                if (!tools.webStorm.empty())  addItem(jbMenu, L"Open with WebStorm",  tools.webStorm,  L"\"%DIR%\"");
+                if (!tools.clion.empty())     addItem(jbMenu, L"Open with CLion",     tools.clion,     L"\"%DIR%\"");
+                menu.subFlyouts.push_back(std::move(jbMenu));
+            }
+        }
+
         // === As Admin submenu ===
-        Flyout asAdmin{};
-        asAdmin.name  = L"AsAdmin";
-        asAdmin.label = L"As Admin";
-        if (!tools.wt.empty())
-            addItem(asAdmin, L"Windows Terminal", tools.wt,          L"-d \"%DIR%\"",  tools.wt,          true);
-        if (!tools.pwsh.empty())
-            addItem(asAdmin, L"PowerShell 7",     tools.pwsh,        L"",              tools.pwsh,        true);
-        addItem(asAdmin,     L"PowerShell",        L"powershell.exe", L"",              L"powershell.exe", true);
-        addItem(asAdmin,     L"Command Prompt",    L"cmd.exe",        L"",              L"cmd.exe",        true);
-        menu.subFlyouts.push_back(std::move(asAdmin));
+        {
+            Flyout asAdmin{};
+            asAdmin.name  = L"AsAdmin";
+            asAdmin.label = L"As Admin";
+            if (!tools.wt.empty())
+                addItem(asAdmin, L"Windows Terminal", tools.wt,          L"-d \"%DIR%\"", tools.wt,          true);
+            if (!tools.pwsh.empty())
+                addItem(asAdmin, L"PowerShell 7",     tools.pwsh,        L"",             tools.pwsh,        true);
+            addItem(asAdmin,     L"PowerShell",        L"powershell.exe", L"",             L"powershell.exe", true);
+            addItem(asAdmin,     L"Command Prompt",    L"cmd.exe",        L"",             L"cmd.exe",        true);
+            menu.subFlyouts.push_back(std::move(asAdmin));
+        }
 
     } else {
-        // === File contexts — editor choices adapt to file type ===
+        // === File contexts — menus adapt to file type and extension ===
+        const std::wstring& ext = snapshot.selectedExt;
+
         switch (kind) {
             case ContextKind::CodeFile:
+                // Language-specific run actions
+                if (ext == L"py" && !tools.python.empty()) {
+                    addItem(menu, L"Run with Python",       tools.python, L"\"%SEL%\"", tools.python, false, L"Run");
+                    addItem(menu, L"Run as Admin (Python)", tools.python, L"\"%SEL%\"", tools.python, true,  L"Run");
+                }
+                // Editors
                 if (!tools.codeInsiders.empty())
-                    addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                    addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders, false, L"Edit");
                 if (!tools.code.empty())
-                    addItem(menu, L"Edit with VS Code",           tools.code,         L"\"%SEL%\"", tools.code);
+                    addItem(menu, L"Edit with VS Code",          tools.code,         L"\"%SEL%\"", tools.code,         false, L"Edit");
                 if (!tools.cursor.empty())
-                    addItem(menu, L"Edit with Cursor",            tools.cursor,       L"\"%SEL%\"", tools.cursor);
+                    addItem(menu, L"Edit with Cursor",           tools.cursor,       L"\"%SEL%\"", tools.cursor,       false, L"Edit");
                 if (!tools.zed.empty())
-                    addItem(menu, L"Edit with Zed",               tools.zed,          L"\"%SEL%\"", tools.zed);
+                    addItem(menu, L"Edit with Zed",              tools.zed,          L"\"%SEL%\"", tools.zed,          false, L"Edit");
+                if (!tools.sublimeText.empty())
+                    addItem(menu, L"Edit with Sublime Text",     tools.sublimeText,  L"\"%SEL%\"", tools.sublimeText,  false, L"Edit");
+                if (!tools.pycharm.empty() && ext == L"py")
+                    addItem(menu, L"Edit with PyCharm",          tools.pycharm,      L"\"%SEL%\"", L"",                false, L"Edit");
                 if (!tools.notepadPP.empty())
-                    addItem(menu, L"Edit with Notepad++",         tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
-                addItem(menu,     L"Edit with Notepad",           L"notepad.exe",     L"\"%SEL%\"");
+                    addItem(menu, L"Edit with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP,    false, L"Edit");
+                addItem(menu,     L"Edit with Notepad",          L"notepad.exe",     L"\"%SEL%\"", L"",                false, L"Edit");
                 break;
 
             case ContextKind::TextFile:
                 if (!tools.codeInsiders.empty())
                     addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                if (!tools.sublimeText.empty())
+                    addItem(menu, L"Open with Sublime Text",     tools.sublimeText,  L"\"%SEL%\"", tools.sublimeText);
                 if (!tools.notepadPP.empty())
                     addItem(menu, L"Open with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
                 addItem(menu,     L"Open with Notepad",          L"notepad.exe",     L"\"%SEL%\"");
@@ -1126,32 +1241,80 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
 
             case ContextKind::ImageFile:
                 addItem(menu, L"Edit with Paint", L"mspaint.exe", L"\"%SEL%\"");
+                if (!tools.codeInsiders.empty())
+                    addItem(menu, L"Open in VS Code", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
                 break;
 
             case ContextKind::ArchiveFile:
                 if (!tools.sevenZip.empty()) {
-                    addItem(menu, L"Extract Here (7-Zip)",          tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\"");
-                    addItem(menu, L"Extract to Subfolder (7-Zip)",  tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\\*\" -y");
+                    addItem(menu, L"Extract Here (7-Zip)",         tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\"",      tools.sevenZip);
+                    addItem(menu, L"Extract to Subfolder (7-Zip)", tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\\*\" -y", tools.sevenZip);
                 }
+                addItem(menu, L"Open",  L"%SEL%", L"");
+                break;
+
+            case ContextKind::ExecutableFile:
+                // Run actions — vary by extension
+                if (ext == L"ps1") {
+                    addItem(menu, L"Run in PowerShell",          L"powershell.exe", L"-ExecutionPolicy Bypass -File \"%SEL%\"", L"powershell.exe", false, L"Run");
+                    addItem(menu, L"Run as Admin in PowerShell", L"powershell.exe", L"-ExecutionPolicy Bypass -File \"%SEL%\"", L"powershell.exe", true,  L"Run");
+                } else if (ext == L"bat" || ext == L"cmd") {
+                    addItem(menu, L"Run in CMD",                  L"cmd.exe", L"/c \"%SEL%\"", L"cmd.exe", false, L"Run");
+                    addItem(menu, L"Run as Admin in CMD",         L"cmd.exe", L"/c \"%SEL%\"", L"cmd.exe", true,  L"Run");
+                } else if (ext == L"vbs") {
+                    addItem(menu, L"Run with WScript",  L"wscript.exe", L"\"%SEL%\"", L"", false, L"Run");
+                    addItem(menu, L"Run with CScript",  L"cscript.exe", L"\"%SEL%\"", L"", false, L"Run");
+                } else {
+                    // .exe, .msi, .com, .scr, etc.
+                    addItem(menu, L"Run",         L"%SEL%", L"", L"", false, L"Run");
+                    addItem(menu, L"Run as Admin", L"%SEL%", L"", L"", true,  L"Run");
+                }
+                // Edit actions
+                if (ext == L"ps1" || ext == L"bat" || ext == L"cmd" || ext == L"vbs") {
+                    if (!tools.codeInsiders.empty())
+                        addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders, false, L"Edit");
+                    if (!tools.notepadPP.empty())
+                        addItem(menu, L"Edit with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP,    false, L"Edit");
+                    addItem(menu,     L"Edit with Notepad",          L"notepad.exe",     L"\"%SEL%\"", L"",                false, L"Edit");
+                }
+                break;
+
+            case ContextKind::MediaFile:
+                if (!tools.vlc.empty())
+                    addItem(menu, L"Play with VLC", tools.vlc, L"\"%SEL%\"", tools.vlc);
+                addItem(menu, L"Open", L"%SEL%", L"");
+                break;
+
+            case ContextKind::DocumentFile:
+                addItem(menu, L"Open", L"%SEL%", L"");
+                if (!tools.codeInsiders.empty())
+                    addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                if (!tools.notepadPP.empty())
+                    addItem(menu, L"Edit with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
                 break;
 
             default:
                 if (!tools.codeInsiders.empty())
                     addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                if (!tools.sublimeText.empty())
+                    addItem(menu, L"Open with Sublime Text",     tools.sublimeText,  L"\"%SEL%\"", tools.sublimeText);
                 if (!tools.notepadPP.empty())
                     addItem(menu, L"Open with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
                 addItem(menu,     L"Open with Notepad",          L"notepad.exe",     L"\"%SEL%\"");
                 break;
         }
 
-        // As Admin for file contexts too
-        Flyout asAdmin{};
-        asAdmin.name  = L"AsAdmin";
-        asAdmin.label = L"As Admin";
-        if (!tools.wt.empty())
-            addItem(asAdmin, L"Windows Terminal Here", tools.wt,          L"-d \"%DIR%\"",  tools.wt,          true);
-        addItem(asAdmin,     L"Command Prompt Here",   L"cmd.exe",        L"",              L"cmd.exe",        true);
-        menu.subFlyouts.push_back(std::move(asAdmin));
+        // As Admin for all file contexts
+        {
+            Flyout asAdmin{};
+            asAdmin.name  = L"AsAdmin";
+            asAdmin.label = L"As Admin";
+            if (!tools.wt.empty())
+                addItem(asAdmin, L"Windows Terminal Here", tools.wt,          L"-d \"%DIR%\"", tools.wt,          true);
+            addItem(asAdmin,     L"Command Prompt Here",   L"cmd.exe",        L"",             L"cmd.exe",        true);
+            addItem(asAdmin,     L"PowerShell Here",       L"powershell.exe", L"",             L"powershell.exe", true);
+            menu.subFlyouts.push_back(std::move(asAdmin));
+        }
     }
 
     auto summary = std::format(L"Context-aware menu built for kind {} with {} items and {} submenus",
