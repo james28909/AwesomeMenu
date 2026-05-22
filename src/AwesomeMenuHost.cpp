@@ -370,6 +370,120 @@ bool deleteRegistryValue(HKEY root, const std::wstring& subKey, const std::wstri
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Tool detection helpers
+// ---------------------------------------------------------------------------
+
+static bool pathExists(const wchar_t* path) {
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static std::wstring findOnPath(const wchar_t* exeName) {
+    wchar_t buf[MAX_PATH] = {};
+    if (wcscpy_s(buf, exeName) == 0 && PathFindOnPathW(buf, nullptr))
+        return buf;
+    return {};
+}
+
+static std::wstring getKnownFolder(const KNOWNFOLDERID& id) {
+    PWSTR p = nullptr;
+    if (SHGetKnownFolderPath(id, 0, nullptr, &p) == S_OK) {
+        std::wstring result = p;
+        CoTaskMemFree(p);
+        return result;
+    }
+    return {};
+}
+
+struct ToolPaths {
+    std::wstring wt;           // Windows Terminal
+    std::wstring pwsh;         // PowerShell 7
+    std::wstring codeInsiders; // VS Code Insiders
+    std::wstring code;         // VS Code
+    std::wstring cursor;       // Cursor
+    std::wstring zed;          // Zed
+    std::wstring devenv;       // Visual Studio 2022 IDE
+    std::wstring vs2022Root;   // VS 2022 install root (for dev shells)
+    std::wstring git;          // Git
+    std::wstring gitBash;      // Git Bash
+    std::wstring notepadPP;    // Notepad++
+    std::wstring sevenZip;     // 7-Zip
+};
+
+static ToolPaths detectTools() {
+    ToolPaths t;
+
+    std::wstring local  = getKnownFolder(FOLDERID_LocalAppData);
+    std::wstring pf     = getKnownFolder(FOLDERID_ProgramFiles);
+    std::wstring pfx86  = getKnownFolder(FOLDERID_ProgramFilesX86);
+
+    auto tryPath = [](std::wstring& dest, const std::wstring& path) {
+        if (dest.empty() && pathExists(path.c_str()))
+            dest = path;
+    };
+
+    // Windows Terminal
+    t.wt = findOnPath(L"wt.exe");
+
+    // PowerShell 7
+    t.pwsh = findOnPath(L"pwsh.exe");
+    if (!pf.empty()) tryPath(t.pwsh, pf + L"\\PowerShell\\7\\pwsh.exe");
+
+    // VS Code Insiders
+    t.codeInsiders = findOnPath(L"code-insiders.exe");
+    if (!local.empty()) tryPath(t.codeInsiders, local + L"\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe");
+
+    // VS Code
+    t.code = findOnPath(L"code.exe");
+    if (!local.empty()) tryPath(t.code, local + L"\\Programs\\Microsoft VS Code\\Code.exe");
+
+    // Cursor
+    t.cursor = findOnPath(L"cursor.exe");
+    if (!local.empty()) {
+        tryPath(t.cursor, local + L"\\Programs\\cursor\\Cursor.exe");
+        tryPath(t.cursor, local + L"\\Programs\\Cursor\\Cursor.exe");
+    }
+
+    // Zed
+    t.zed = findOnPath(L"zed.exe");
+    if (!local.empty()) tryPath(t.zed, local + L"\\Programs\\Zed\\zed.exe");
+
+    // Git
+    t.git = findOnPath(L"git.exe");
+    if (!pf.empty())   tryPath(t.git, pf   + L"\\Git\\bin\\git.exe");
+    if (!pfx86.empty()) tryPath(t.git, pfx86 + L"\\Git\\bin\\git.exe");
+
+    // Git Bash
+    if (!pf.empty())   tryPath(t.gitBash, pf   + L"\\Git\\git-bash.exe");
+    if (!pfx86.empty()) tryPath(t.gitBash, pfx86 + L"\\Git\\git-bash.exe");
+
+    // Notepad++
+    t.notepadPP = findOnPath(L"notepad++.exe");
+    if (!pf.empty())   tryPath(t.notepadPP, pf   + L"\\Notepad++\\notepad++.exe");
+    if (!pfx86.empty()) tryPath(t.notepadPP, pfx86 + L"\\Notepad++\\notepad++.exe");
+
+    // 7-Zip
+    t.sevenZip = findOnPath(L"7z.exe");
+    if (!pf.empty())   tryPath(t.sevenZip, pf   + L"\\7-Zip\\7z.exe");
+    if (!pfx86.empty()) tryPath(t.sevenZip, pfx86 + L"\\7-Zip\\7z.exe");
+
+    // Visual Studio 2022 (check all editions)
+    if (!pf.empty()) {
+        static const wchar_t* editions[] = { L"Professional", L"Enterprise", L"Community", L"BuildTools" };
+        for (const wchar_t* ed : editions) {
+            std::wstring root   = pf + L"\\Microsoft Visual Studio\\2022\\" + ed;
+            std::wstring devenv = root + L"\\Common7\\IDE\\devenv.exe";
+            if (pathExists(devenv.c_str())) {
+                t.devenv     = devenv;
+                t.vs2022Root = root;
+                break;
+            }
+        }
+    }
+
+    return t;
+}
+
 } // namespace
 
 /*
@@ -841,447 +955,210 @@ ContextKind AwesomeMenuHost::detectContextKind(const ContextSnapshot& snapshot) 
     return ContextKind::Background;
 }
 
-/*
- * Unlimited Menu Test Generator
- * TEST STRUCTURE:
- * - Admin Tools Section: 8 elevated system utilities
- * - Development Section: 10 development environment tools
- * - System Utilities Section: 12 system management tools
- *
- * This function proves that our shell extension can display unlimited
- * cascading menu items, which is impossible with standard registry-based
- * shell extensions due to Windows' built-in parsing limitations.
- */
 void AwesomeMenuHost::createUnlimitedTestMenu() {
-    // Create test flyout with prominent labeling
-    Flyout testFlyout{};
-    testFlyout.name = L"UnlimitedTest";
-    testFlyout.label = L"🚀 UNLIMITED TEST (25+ Items)";    // Prominent label with emoji
-    testFlyout.showIn = L"background;directory;file";        // Show everywhere for testing
-
-    // Create multiple sections with many items to test Windows limits
-    // This demonstrates that IContextMenu3 can handle 25+ items while
-    // registry-based shell extensions are limited to ~16 items
-
-    // === SECTION 1: ADMIN TOOLS (8 items) ===
-    // Elevated system administration utilities
-    std::vector<std::wstring> adminTools = {
-        L"Command Prompt (Admin)", L"PowerShell (Admin)", L"Windows Terminal (Admin)",
-        L"Registry Editor", L"Device Manager", L"Event Viewer",
-        L"System Configuration", L"Computer Management"
-    };
-
-    for (size_t i = 0; i < adminTools.size(); ++i) {
-        FlyoutItem item{};
-        item.label = adminTools[i];
-        item.section = L"Admin Tools";               // Groups items with separator
-        item.command = L"cmd.exe";
-        item.args = L"/c echo \"Testing: " + adminTools[i] + L"\" & pause";
-        item.workingDir = L"%DIR%";                  // Execute in context directory
-        item.runAs = true;                           // Require UAC elevation
-        testFlyout.items.push_back(std::move(item));
-    }
-
-    // === SECTION 2: DEVELOPMENT TOOLS (10 items) ===
-    // Software development environment and tools
-    std::vector<std::wstring> devTools = {
-        L"Visual Studio Code", L"Visual Studio 2022", L"Visual Studio 2019",
-        L"Notepad++", L"Git Bash", L"GitHub Desktop",
-        L"Docker Desktop", L"Postman", L"Node.js REPL", L"Python REPL"
-    };
-
-    for (size_t i = 0; i < devTools.size(); ++i) {
-        FlyoutItem item{};
-        item.label = devTools[i];
-        item.section = L"Development";               // Groups items with separator
-        item.command = L"notepad.exe";
-        item.args = L"\"" + testFlyout.label + L" - " + devTools[i] + L".txt\"";
-        item.workingDir = L"%DIR%";                  // Execute in context directory
-        item.runAs = false;                          // No elevation required
-        testFlyout.items.push_back(std::move(item));
-    }
-
-    // === SECTION 3: SYSTEM UTILITIES (12 items) ===
-    // System monitoring and maintenance tools
-    std::vector<std::wstring> sysUtils = {
-        L"Task Manager", L"Resource Monitor", L"System Information",
-        L"Disk Cleanup", L"Disk Management", L"Services",
-        L"Performance Monitor", L"Windows Memory Diagnostic",
-        L"System File Checker", L"Check Disk", L"Defragment",
-        L"Windows Update"
-    };
-
-    for (size_t i = 0; i < sysUtils.size(); ++i) {
-        FlyoutItem item{};
-        item.label = sysUtils[i];
-        item.section = L"System Utilities";          // Groups items with separator
-        item.command = L"powershell.exe";
-        item.args = L"-Command \"Write-Host 'Testing unlimited menu: " + sysUtils[i] + L"'; Read-Host 'Press Enter to continue'\"";
-        item.workingDir = L"%DIR%";                  // Execute in context directory
-        item.runAs = false;                          // No elevation required
-        testFlyout.items.push_back(std::move(item));
-    }
-
-    // Add the test flyout FIRST to make it prominent in context menu
-    // This ensures the unlimited test menu appears at the top for easy verification
-    m_flyouts.insert(m_flyouts.begin(), std::move(testFlyout));
+    // Retired — superseded by createContextAwareAwesomeMenu()
 }
 
-/*
- * Complete AwesomeMenu Hardcoded Structure
- * =========================================
- * Recreates the complete AwesomeMenu configuration programmatically.
- * This bypasses Windows' 16-item registry parsing limit by building
- * the menu structure directly in code using IContextMenu3.
- *
- * MENU STRUCTURE:
- * - As Admin Submenu: 15+ elevated development shells
- *   - VS 2019/2022/Insiders x86/x64 Command/PowerShell variants
- *   - Standard elevated Command Prompt, PowerShell, Windows Terminal
- * - Direct Items: System utilities, development tools, applications
- *
- * This demonstrates unlimited cascading capability while providing
- * a comprehensive development environment context menu.
- */
 void AwesomeMenuHost::createCompleteAwesomeMenu() {
-
-    // Create root AwesomeMenu flyout
-    Flyout awesomeMenu{};
-    awesomeMenu.name = L"AwesomeMenu";
-    awesomeMenu.label = L"Awesome Menu!!!";           // Enthusiastic branding
-    awesomeMenu.showIn = L""; // Show in all contexts - items will be filtered individually
-
-    // === AS ADMIN SUBMENU (Complete with ALL tools) ===
-    // This submenu contains 15+ elevated development shells, demonstrating
-    // unlimited cascading capability that's impossible with registry-based extensions
-    Flyout asAdminSubmenu{};
-    asAdminSubmenu.name = L"AsAdmin";
-    asAdminSubmenu.label = L"As Admin";                // Submenu for elevated commands
-
-    // Standard elevated Command Prompt
-    FlyoutItem cmdAdmin{};
-    cmdAdmin.label = L"Command Prompt";
-    cmdAdmin.command = L"cmd.exe";
-    cmdAdmin.args = L"";                              // No additional arguments
-    cmdAdmin.workingDir = L"%DIR%";                   // Start in context directory
-    cmdAdmin.runAs = true;                            // Require UAC elevation
-    cmdAdmin.icon = L"cmd.exe";                       // Extract icon from executable
-    asAdminSubmenu.items.push_back(std::move(cmdAdmin));
-
-    // Standard elevated PowerShell
-    FlyoutItem psAdmin{};
-    psAdmin.label = L"PowerShell";
-    psAdmin.command = L"powershell.exe";
-    psAdmin.args = L"";                               // No additional arguments
-    psAdmin.workingDir = L"%DIR%";                    // Start in context directory
-    psAdmin.runAs = true;                             // Require UAC elevation
-    psAdmin.icon = L"powershell.exe";                 // Extract icon from executable
-    asAdminSubmenu.items.push_back(std::move(psAdmin));
-
-    // Modern elevated Windows Terminal
-    FlyoutItem wtAdmin{};
-    wtAdmin.label = L"Windows Terminal";
-    wtAdmin.command = L"wt.exe";
-    wtAdmin.args = L"-d \"%DIR%\"";                   // Start in context directory
-    wtAdmin.workingDir = L"%DIR%";
-    wtAdmin.runAs = true;                             // Require UAC elevation
-    wtAdmin.icon = L"wt.exe";                         // Extract icon from executable
-    asAdminSubmenu.items.push_back(std::move(wtAdmin));
-
-    // Visual Studio 2019 Developer Command Prompt (x64 architecture)
-    FlyoutItem vs2019x64cmd{};
-    vs2019x64cmd.label = L"VS 2019 DevShell (x64 CMD)";
-    vs2019x64cmd.command = L"powershell.exe";
-    vs2019x64cmd.args = L"-Command \"Start-Process 'C:\\tools\\Start-CmdDevShell.cmd' -ArgumentList '/2019' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2019x64cmd.workingDir = L"%DIR%";
-    vs2019x64cmd.runAs = false;                       // PowerShell handles elevation
-    asAdminSubmenu.items.push_back(std::move(vs2019x64cmd));
-
-    // VS 2019 x64 PS
-    FlyoutItem vs2019x64ps{};
-    vs2019x64ps.label = L"VS 2019 DevShell (x64 PS)";
-    vs2019x64ps.command = L"powershell.exe";
-    vs2019x64ps.args = L"-Command \"Start-Process 'C:\\tools\\Start-VSDevShell.ps1' -ArgumentList '-x64', '-VSVersion', '2019' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2019x64ps.workingDir = L"%DIR%";
-    vs2019x64ps.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2019x64ps));
-
-    // VS 2019 x86 CMD
-    FlyoutItem vs2019x86cmd{};
-    vs2019x86cmd.label = L"VS 2019 DevShell (x86 CMD)";
-    vs2019x86cmd.command = L"powershell.exe";
-    vs2019x86cmd.args = L"-Command \"Start-Process 'C:\\tools\\Start-CmdDevShell.cmd' -ArgumentList '/x86', '/2019' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2019x86cmd.workingDir = L"%DIR%";
-    vs2019x86cmd.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2019x86cmd));
-
-    // VS 2019 x86 PS
-    FlyoutItem vs2019x86ps{};
-    vs2019x86ps.label = L"VS 2019 DevShell (x86 PS)";
-    vs2019x86ps.command = L"powershell.exe";
-    vs2019x86ps.args = L"-Command \"Start-Process 'C:\\tools\\Start-VSDevShell.ps1' -ArgumentList '/x86', '-VSVersion', '2019' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2019x86ps.workingDir = L"%DIR%";
-    vs2019x86ps.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2019x86ps));
-
-    // VS 2022 x64 CMD
-    FlyoutItem vs2022x64cmd{};
-    vs2022x64cmd.label = L"VS 2022 DevShell (x64 CMD)";
-    vs2022x64cmd.command = L"powershell.exe";
-    vs2022x64cmd.args = L"-Command \"Start-Process 'C:\\tools\\Start-CmdDevShell.cmd' -ArgumentList '/2022' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2022x64cmd.workingDir = L"%DIR%";
-    vs2022x64cmd.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2022x64cmd));
-
-    // VS 2022 x64 PS
-    FlyoutItem vs2022x64ps{};
-    vs2022x64ps.label = L"VS 2022 DevShell (x64 PS)";
-    vs2022x64ps.command = L"powershell.exe";
-    vs2022x64ps.args = L"-Command \"Start-Process 'C:\\tools\\Start-VSDevShell.ps1' -ArgumentList '-x64', '-VSVersion', '2022' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2022x64ps.workingDir = L"%DIR%";
-    vs2022x64ps.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2022x64ps));
-
-    // VS 2022 x86 CMD
-    FlyoutItem vs2022x86cmd{};
-    vs2022x86cmd.label = L"VS 2022 DevShell (x86 CMD)";
-    vs2022x86cmd.command = L"powershell.exe";
-    vs2022x86cmd.args = L"-Command \"Start-Process 'C:\\tools\\Start-CmdDevShell.cmd' -ArgumentList '/x86', '/2022' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2022x86cmd.workingDir = L"%DIR%";
-    vs2022x86cmd.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2022x86cmd));
-
-    // VS 2022 x86 PS
-    FlyoutItem vs2022x86ps{};
-    vs2022x86ps.label = L"VS 2022 DevShell (x86 PS)";
-    vs2022x86ps.command = L"powershell.exe";
-    vs2022x86ps.args = L"-Command \"Start-Process 'C:\\tools\\Start-VSDevShell.ps1' -ArgumentList '/x86', '-VSVersion', '2022' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vs2022x86ps.workingDir = L"%DIR%";
-    vs2022x86ps.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vs2022x86ps));
-
-    // VS Insiders x64 CMD
-    FlyoutItem vsInsidersx64cmd{};
-    vsInsidersx64cmd.label = L"VS Insiders DevShell (x64 CMD)";
-    vsInsidersx64cmd.command = L"powershell.exe";
-    vsInsidersx64cmd.args = L"-Command \"Start-Process 'C:\\tools\\Start-CmdDevShell.cmd' -ArgumentList '/Insiders' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vsInsidersx64cmd.workingDir = L"%DIR%";
-    vsInsidersx64cmd.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vsInsidersx64cmd));
-
-    // VS Insiders x64 PS
-    FlyoutItem vsInsidersx64ps{};
-    vsInsidersx64ps.label = L"VS Insiders DevShell (x64 PS)";
-    vsInsidersx64ps.command = L"powershell.exe";
-    vsInsidersx64ps.args = L"-Command \"Start-Process 'C:\\tools\\Start-VSDevShell.ps1' -ArgumentList '-x64', '-VSVersion', 'Insiders' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vsInsidersx64ps.workingDir = L"%DIR%";
-    vsInsidersx64ps.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vsInsidersx64ps));
-
-    // VS Insiders x86 CMD
-    FlyoutItem vsInsidersx86cmd{};
-    vsInsidersx86cmd.label = L"VS Insiders DevShell (x86 CMD)";
-    vsInsidersx86cmd.command = L"powershell.exe";
-    vsInsidersx86cmd.args = L"-Command \"Start-Process 'C:\\tools\\Start-CmdDevShell.cmd' -ArgumentList '/x86', '/Insiders' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vsInsidersx86cmd.workingDir = L"%DIR%";
-    vsInsidersx86cmd.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vsInsidersx86cmd));
-
-    // VS Insiders x86 PS
-    FlyoutItem vsInsidersx86ps{};
-    vsInsidersx86ps.label = L"VS Insiders DevShell (x86 PS)";
-    vsInsidersx86ps.command = L"powershell.exe";
-    vsInsidersx86ps.args = L"-Command \"Start-Process 'C:\\tools\\Start-VSDevShell.ps1' -ArgumentList '/x86', '-VSVersion', 'Insiders' -Verb RunAs -WorkingDirectory '%DIR%'\"";
-    vsInsidersx86ps.workingDir = L"%DIR%";
-    vsInsidersx86ps.runAs = false;
-    asAdminSubmenu.items.push_back(std::move(vsInsidersx86ps));
-
-    // Add the complete As Admin submenu to main menu
-    // This creates unlimited cascading depth beyond Windows' 16-item registry limit
-    awesomeMenu.subFlyouts.push_back(std::move(asAdminSubmenu));
-
-    // === OTHER TOP-LEVEL ITEMS ===
-
-    // Control Panel
-    FlyoutItem controlPanel{};
-    controlPanel.label = L"Control Panel";
-    controlPanel.command = L"control.exe";
-    controlPanel.workingDir = L"%DIR%";
-    controlPanel.icon = L"control.exe";
-    awesomeMenu.items.push_back(std::move(controlPanel));
-
-    // Device Manager
-    FlyoutItem deviceManager{};
-    deviceManager.label = L"Device Manager";
-    deviceManager.command = L"devmgmt.msc";
-    deviceManager.workingDir = L"%DIR%";
-    awesomeMenu.items.push_back(std::move(deviceManager));
-
-    // MMC
-    FlyoutItem mmc{};
-    mmc.label = L"MMC";
-    mmc.command = L"mmc.exe";
-    mmc.workingDir = L"%DIR%";
-    awesomeMenu.items.push_back(std::move(mmc));
-
-    // Open VSCode Insiders
-    FlyoutItem vscode{};
-    vscode.label = L"Open in VSCode Insiders";
-    vscode.command = L"code-insiders.exe";
-    vscode.args = L"\"%DIR%\"";
-    vscode.workingDir = L"%DIR%";
-    vscode.icon = L"code-insiders.exe";
-    awesomeMenu.items.push_back(std::move(vscode));
-
-    // PowerShell 7
-    FlyoutItem ps7{};
-    ps7.label = L"PowerShell 7";
-    ps7.command = L"pwsh.exe";
-    ps7.workingDir = L"%DIR%";
-    ps7.icon = L"pwsh.exe";
-    awesomeMenu.items.push_back(std::move(ps7));
-
-    // PowerShell ISE
-    FlyoutItem psIse{};
-    psIse.label = L"PowerShell ISE";
-    psIse.command = L"powershell_ise.exe";
-    psIse.workingDir = L"%DIR%";
-    awesomeMenu.items.push_back(std::move(psIse));
-
-    // Rocket League
-    FlyoutItem rocketLeague{};
-    rocketLeague.label = L"Rocket League";
-    rocketLeague.command = L"explorer.exe";
-    rocketLeague.args = L"\"steam://run/252950\"";
-    rocketLeague.workingDir = L"%DIR%";
-    awesomeMenu.items.push_back(std::move(rocketLeague));
-
-    // Steam
-    FlyoutItem steam{};
-    steam.label = L"Steam";
-    steam.command = L"pwsh.exe";
-    steam.workingDir = L"%DIR%";
-    awesomeMenu.items.push_back(std::move(steam));
-
-    // Add the complete AwesomeMenu to flyouts
-    m_flyouts.push_back(std::move(awesomeMenu));
+    // Retired — superseded by createContextAwareAwesomeMenu()
 }
 
-/*
- * Context-Aware AwesomeMenu Creation System
- * ==========================================
- * Creates dynamic AwesomeMenu content based on what the user right-clicked.
- * This enables intelligent tool selection and context-appropriate options.
- */
 Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& snapshot) {
     logDebug(L"Creating context-aware AwesomeMenu", LogCategory::Menu);
 
-    Flyout awesomeMenu{};
-    awesomeMenu.name = L"AwesomeMenu";
-    awesomeMenu.label = L"Awesome Menu";
-    awesomeMenu.showIn = L"";
+    Flyout menu{};
+    menu.name = L"AwesomeMenu";
+    menu.label = L"Awesome Menu";
 
     ContextKind kind = snapshot.kind;
+    ToolPaths tools = detectTools();
 
-    switch (kind) {
-        case ContextKind::Background:
-        case ContextKind::Directory: {
-            FlyoutItem cmdHere{};
-            cmdHere.label = L"Command Prompt Here";
-            cmdHere.command = L"cmd.exe";
-            cmdHere.workingDir = L"%DIR%";
-            cmdHere.icon = L"cmd.exe";
-            awesomeMenu.items.push_back(std::move(cmdHere));
+    // Lambda to add a FlyoutItem to any target flyout
+    auto addItem = [](Flyout& target, std::wstring label, std::wstring cmd,
+                      std::wstring args = L"", std::wstring icon = L"",
+                      bool runAs = false, std::wstring section = L"") {
+        FlyoutItem item{};
+        item.label      = std::move(label);
+        item.command    = std::move(cmd);
+        item.args       = std::move(args);
+        item.icon       = std::move(icon);
+        item.workingDir = L"%DIR%";
+        item.runAs      = runAs;
+        item.section    = std::move(section);
+        target.items.push_back(std::move(item));
+    };
 
-            FlyoutItem psHere{};
-            psHere.label = L"PowerShell Here";
-            psHere.command = L"powershell.exe";
-            psHere.workingDir = L"%DIR%";
-            psHere.icon = L"powershell.exe";
-            awesomeMenu.items.push_back(std::move(psHere));
+    bool isFolderCtx = (kind == ContextKind::Background   ||
+                        kind == ContextKind::Directory     ||
+                        kind == ContextKind::DesktopLocation   ||
+                        kind == ContextKind::DocumentsLocation ||
+                        kind == ContextKind::SystemLocation    ||
+                        kind == ContextKind::ProjectLocation   ||
+                        kind == ContextKind::HardDrive         ||
+                        kind == ContextKind::RemovableDrive    ||
+                        kind == ContextKind::NetworkDrive      ||
+                        kind == ContextKind::OpticalDrive);
 
-            FlyoutItem vsCode{};
-            vsCode.label = L"Open in VS Code";
-            vsCode.command = L"code";
-            vsCode.args = L"\"%DIR%\"";
-            vsCode.workingDir = L"%DIR%";
-            awesomeMenu.items.push_back(std::move(vsCode));
-            break;
+    if (isFolderCtx || kind == ContextKind::Multi) {
+        // === Terminals ===
+        if (!tools.wt.empty())
+            addItem(menu, L"Windows Terminal Here", tools.wt,        L"-d \"%DIR%\"",  tools.wt,        false, L"Terminals");
+        if (!tools.pwsh.empty())
+            addItem(menu, L"PowerShell 7 Here",     tools.pwsh,      L"",              tools.pwsh,      false, L"Terminals");
+        addItem(menu,     L"PowerShell Here",        L"powershell.exe", L"",            L"powershell.exe", false, L"Terminals");
+        addItem(menu,     L"Command Prompt Here",    L"cmd.exe",      L"",              L"cmd.exe",      false, L"Terminals");
+
+        // === IDEs / Editors ===
+        if (!tools.codeInsiders.empty())
+            addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%DIR%\"", tools.codeInsiders, false, L"Editors");
+        if (!tools.code.empty())
+            addItem(menu, L"Open with VS Code",       tools.code,     L"\"%DIR%\"",     tools.code,     false, L"Editors");
+        if (!tools.cursor.empty())
+            addItem(menu, L"Open with Cursor",        tools.cursor,   L"\"%DIR%\"",     tools.cursor,   false, L"Editors");
+        if (!tools.zed.empty())
+            addItem(menu, L"Open with Zed",           tools.zed,      L"\"%DIR%\"",     tools.zed,      false, L"Editors");
+        if (!tools.devenv.empty())
+            addItem(menu, L"Open with Visual Studio 2022", tools.devenv, L"\"%DIR%\"",  tools.devenv,   false, L"Editors");
+
+        // === Git submenu ===
+        if (!tools.git.empty() || !tools.gitBash.empty()) {
+            Flyout gitMenu{};
+            gitMenu.name  = L"Git";
+            gitMenu.label = L"Git";
+            if (!tools.git.empty())
+                addItem(gitMenu, L"Git GUI Here",  tools.git,     L"gui", tools.git);
+            if (!tools.gitBash.empty())
+                addItem(gitMenu, L"Git Bash Here", tools.gitBash, L"",    tools.gitBash);
+            menu.subFlyouts.push_back(std::move(gitMenu));
         }
 
-        case ContextKind::CodeFile: {
-            FlyoutItem editVsCode{};
-            editVsCode.label = L"Edit in VS Code";
-            editVsCode.command = L"code";
-            editVsCode.args = L"\"%SEL%\"";
-            editVsCode.workingDir = L"%DIR%";
-            awesomeMenu.items.push_back(std::move(editVsCode));
+        // === VS 2022 Dev Shells submenu ===
+        if (!tools.vs2022Root.empty()) {
+            std::wstring vcvarsall = tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvarsall.bat";
+            std::wstring devShellDll = tools.vs2022Root + L"\\Common7\\Tools\\Microsoft.VisualStudio.DevShell.dll";
 
-            FlyoutItem editNotepad{};
-            editNotepad.label = L"Edit in Notepad++";
-            editNotepad.command = L"notepad++.exe";
-            editNotepad.args = L"\"%SEL%\"";
-            editNotepad.workingDir = L"%DIR%";
-            awesomeMenu.items.push_back(std::move(editNotepad));
-            break;
+            if (pathExists(vcvarsall.c_str())) {
+                Flyout devShells{};
+                devShells.name  = L"DevShells";
+                devShells.label = L"VS 2022 Dev Shells";
+
+                // x64 CMD
+                FlyoutItem x64cmd{};
+                x64cmd.label     = L"x64 Native Tools CMD";
+                x64cmd.command   = L"cmd.exe";
+                x64cmd.args      = L"/k \"\"" + tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvars64.bat\"\"";
+                x64cmd.workingDir = L"%DIR%";
+                x64cmd.icon      = L"cmd.exe";
+                devShells.items.push_back(std::move(x64cmd));
+
+                // x86 CMD
+                FlyoutItem x86cmd{};
+                x86cmd.label     = L"x86 Native Tools CMD";
+                x86cmd.command   = L"cmd.exe";
+                x86cmd.args      = L"/k \"\"" + tools.vs2022Root + L"\\VC\\Auxiliary\\Build\\vcvars32.bat\"\"";
+                x86cmd.workingDir = L"%DIR%";
+                x86cmd.icon      = L"cmd.exe";
+                devShells.items.push_back(std::move(x86cmd));
+
+                // x64 PowerShell (uses Enter-VsDevShell if the DLL is available)
+                if (pathExists(devShellDll.c_str())) {
+                    FlyoutItem x64ps{};
+                    x64ps.label   = L"x64 Native Tools PowerShell";
+                    x64ps.command = L"powershell.exe";
+                    x64ps.args    = L"-NoExit -Command \"& { Import-Module '" + devShellDll +
+                                    L"'; Enter-VsDevShell -VsInstallPath '" + tools.vs2022Root +
+                                    L"' -DevCmdArguments '-arch=x64' -SkipAutomaticLocation }\"";
+                    x64ps.workingDir = L"%DIR%";
+                    x64ps.icon    = L"powershell.exe";
+                    devShells.items.push_back(std::move(x64ps));
+
+                    FlyoutItem x86ps{};
+                    x86ps.label   = L"x86 Native Tools PowerShell";
+                    x86ps.command = L"powershell.exe";
+                    x86ps.args    = L"-NoExit -Command \"& { Import-Module '" + devShellDll +
+                                    L"'; Enter-VsDevShell -VsInstallPath '" + tools.vs2022Root +
+                                    L"' -DevCmdArguments '-arch=x86' -SkipAutomaticLocation }\"";
+                    x86ps.workingDir = L"%DIR%";
+                    x86ps.icon    = L"powershell.exe";
+                    devShells.items.push_back(std::move(x86ps));
+                }
+
+                menu.subFlyouts.push_back(std::move(devShells));
+            }
         }
 
-        case ContextKind::ImageFile: {
-            FlyoutItem viewImage{};
-            viewImage.label = L"Open with Paint";
-            viewImage.command = L"mspaint.exe";
-            viewImage.args = L"\"%SEL%\"";
-            awesomeMenu.items.push_back(std::move(viewImage));
-            break;
+        // === As Admin submenu ===
+        Flyout asAdmin{};
+        asAdmin.name  = L"AsAdmin";
+        asAdmin.label = L"As Admin";
+        if (!tools.wt.empty())
+            addItem(asAdmin, L"Windows Terminal", tools.wt,          L"-d \"%DIR%\"",  tools.wt,          true);
+        if (!tools.pwsh.empty())
+            addItem(asAdmin, L"PowerShell 7",     tools.pwsh,        L"",              tools.pwsh,        true);
+        addItem(asAdmin,     L"PowerShell",        L"powershell.exe", L"",              L"powershell.exe", true);
+        addItem(asAdmin,     L"Command Prompt",    L"cmd.exe",        L"",              L"cmd.exe",        true);
+        menu.subFlyouts.push_back(std::move(asAdmin));
+
+    } else {
+        // === File contexts — editor choices adapt to file type ===
+        switch (kind) {
+            case ContextKind::CodeFile:
+                if (!tools.codeInsiders.empty())
+                    addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                if (!tools.code.empty())
+                    addItem(menu, L"Edit with VS Code",           tools.code,         L"\"%SEL%\"", tools.code);
+                if (!tools.cursor.empty())
+                    addItem(menu, L"Edit with Cursor",            tools.cursor,       L"\"%SEL%\"", tools.cursor);
+                if (!tools.zed.empty())
+                    addItem(menu, L"Edit with Zed",               tools.zed,          L"\"%SEL%\"", tools.zed);
+                if (!tools.notepadPP.empty())
+                    addItem(menu, L"Edit with Notepad++",         tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
+                addItem(menu,     L"Edit with Notepad",           L"notepad.exe",     L"\"%SEL%\"");
+                break;
+
+            case ContextKind::TextFile:
+                if (!tools.codeInsiders.empty())
+                    addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                if (!tools.notepadPP.empty())
+                    addItem(menu, L"Open with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
+                addItem(menu,     L"Open with Notepad",          L"notepad.exe",     L"\"%SEL%\"");
+                break;
+
+            case ContextKind::ImageFile:
+                addItem(menu, L"Edit with Paint", L"mspaint.exe", L"\"%SEL%\"");
+                break;
+
+            case ContextKind::ArchiveFile:
+                if (!tools.sevenZip.empty()) {
+                    addItem(menu, L"Extract Here (7-Zip)",          tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\"");
+                    addItem(menu, L"Extract to Subfolder (7-Zip)",  tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\\*\" -y");
+                }
+                break;
+
+            default:
+                if (!tools.codeInsiders.empty())
+                    addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
+                if (!tools.notepadPP.empty())
+                    addItem(menu, L"Open with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
+                addItem(menu,     L"Open with Notepad",          L"notepad.exe",     L"\"%SEL%\"");
+                break;
         }
 
-        case ContextKind::ArchiveFile: {
-            FlyoutItem extract{};
-            extract.label = L"Extract Here";
-            extract.command = L"7z.exe";
-            extract.args = L"x \"%SEL%\" -o\"%DIR%\"";
-            extract.workingDir = L"%DIR%";
-            awesomeMenu.items.push_back(std::move(extract));
-            break;
-        }
-
-        default: {
-            FlyoutItem cmdHere{};
-            cmdHere.label = L"Command Prompt Here";
-            cmdHere.command = L"cmd.exe";
-            cmdHere.workingDir = L"%DIR%";
-            cmdHere.icon = L"cmd.exe";
-            awesomeMenu.items.push_back(std::move(cmdHere));
-            break;
-        }
+        // As Admin for file contexts too
+        Flyout asAdmin{};
+        asAdmin.name  = L"AsAdmin";
+        asAdmin.label = L"As Admin";
+        if (!tools.wt.empty())
+            addItem(asAdmin, L"Windows Terminal Here", tools.wt,          L"-d \"%DIR%\"",  tools.wt,          true);
+        addItem(asAdmin,     L"Command Prompt Here",   L"cmd.exe",        L"",              L"cmd.exe",        true);
+        menu.subFlyouts.push_back(std::move(asAdmin));
     }
 
-    Flyout asAdminSubmenu{};
-    asAdminSubmenu.name = L"AsAdmin";
-    asAdminSubmenu.label = L"As Admin";
-
-    FlyoutItem cmdAdmin{};
-    cmdAdmin.label = L"Command Prompt (Admin)";
-    cmdAdmin.command = L"cmd.exe";
-    cmdAdmin.workingDir = L"%DIR%";
-    cmdAdmin.runAs = true;
-    cmdAdmin.icon = L"cmd.exe";
-    asAdminSubmenu.items.push_back(std::move(cmdAdmin));
-
-    FlyoutItem psAdmin{};
-    psAdmin.label = L"PowerShell (Admin)";
-    psAdmin.command = L"powershell.exe";
-    psAdmin.workingDir = L"%DIR%";
-    psAdmin.runAs = true;
-    psAdmin.icon = L"powershell.exe";
-    asAdminSubmenu.items.push_back(std::move(psAdmin));
-
-    awesomeMenu.subFlyouts.push_back(std::move(asAdminSubmenu));
-
-    auto summary = std::format(L"Context-aware menu built for kind {} with {} direct items", static_cast<int>(kind), awesomeMenu.items.size());
+    auto summary = std::format(L"Context-aware menu built for kind {} with {} items and {} submenus",
+                               static_cast<int>(kind), menu.items.size(), menu.subFlyouts.size());
     logDebug(summary, LogCategory::Menu);
 
-    return awesomeMenu;
+    return menu;
 }
 
 UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hMenu, UINT indexMenu, UINT idCmdFirst, UINT uFlags) {
@@ -1990,6 +1867,7 @@ HRESULT AwesomeMenuHost::runItem(const FlyoutItem& it) const {
     std::wstring wdir = it.workingDir.empty() ? m_context.contextDir : it.workingDir;
 
     // Expand dynamic placeholders with current context
+    expandPlaceholders(exe);                  // Replace %SEL% in command (e.g. run selected exe)
     expandPlaceholders(args);                 // Replace %DIR%, %SEL% in arguments
     expandPlaceholders(wdir);                 // Replace %DIR%, %SEL% in working directory
 
