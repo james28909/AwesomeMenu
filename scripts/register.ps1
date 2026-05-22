@@ -22,11 +22,13 @@ $guid = '{E0E8C3B2-1E8C-4C15-9A4F-8A7C0F4A7F10}'
 reg add "HKCU\Software\Classes\CLSID\$guid\InprocServer32" /ve /t REG_SZ /d "$dll" /f | Out-Null
 reg add "HKCU\Software\Classes\CLSID\$guid\InprocServer32" /v ThreadingModel /t REG_SZ /d Apartment /f | Out-Null
 
-# Context menu handlers under HKCU\Software\Classes (per-user only)
-# Using highly selective registration to avoid any overlapping contexts
+# Context menu handlers - matches the 6 contexts in DllRegisterServer
 reg add "HKCU\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-reg add "HKCU\Software\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
-reg add "HKCU\Software\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
+reg add "HKCU\Software\Classes\Directory\shellex\ContextMenuHandlers\AwesomeMenuHost"            /ve /t REG_SZ /d "$guid" /f | Out-Null
+reg add "HKCU\Software\Classes\Folder\shellex\ContextMenuHandlers\AwesomeMenuHost"               /ve /t REG_SZ /d "$guid" /f | Out-Null
+reg add "HKCU\Software\Classes\*\shellex\ContextMenuHandlers\AwesomeMenuHost"                    /ve /t REG_SZ /d "$guid" /f | Out-Null
+reg add "HKCU\Software\Classes\AllFileSystemObjects\shellex\ContextMenuHandlers\AwesomeMenuHost" /ve /t REG_SZ /d "$guid" /f | Out-Null
+reg add "HKCU\Software\Classes\Drive\shellex\ContextMenuHandlers\AwesomeMenuHost"                /ve /t REG_SZ /d "$guid" /f | Out-Null
 
 Write-Host "Registered AwesomeMenuHost per-user." -ForegroundColor Green
 Write-Host "Restarting Explorer..." -ForegroundColor Yellow
