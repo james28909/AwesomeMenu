@@ -554,6 +554,190 @@ static ToolPaths detectTools() {
     return s_cached;
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic "Open With" registry lookup
+// ---------------------------------------------------------------------------
+
+// Inline registry string reader — RegReadSz is defined after the namespace closes.
+static std::wstring readRegStr(HKEY hKey, const wchar_t* name) {
+    DWORD type = 0, cb = 0;
+    if (RegQueryValueExW(hKey, name, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS) return {};
+    if (type != REG_SZ && type != REG_EXPAND_SZ) return {};
+    if (cb == 0 || cb > 32768) return {};
+    std::wstring s(cb / sizeof(wchar_t) + 1, L'\0');
+    DWORD sz = cb;
+    if (RegQueryValueExW(hKey, name, nullptr, &type, (LPBYTE)s.data(), &sz) != ERROR_SUCCESS) return {};
+    s.resize(sz / sizeof(wchar_t));
+    while (!s.empty() && s.back() == L'\0') s.pop_back();
+    return s;
+}
+
+struct OpenWithEntry {
+    std::wstring displayName;
+    std::wstring exePath;
+};
+
+// Parse the executable path out of a shell command string.
+// Handles: "C:\path\app.exe" "%1"  and  C:\path\app.exe %1
+static std::wstring extractExeFromCommand(const std::wstring& cmd) {
+    if (cmd.empty()) return {};
+    if (cmd[0] == L'"') {
+        size_t end = cmd.find(L'"', 1);
+        if (end != std::wstring::npos) return cmd.substr(1, end - 1);
+    } else {
+        size_t sp = cmd.find(L' ');
+        return (sp != std::wstring::npos) ? cmd.substr(0, sp) : cmd;
+    }
+    return {};
+}
+
+// Resolve a bare exe name to a full path via PATH; absolute paths are returned as-is.
+static std::wstring resolveExePath(const std::wstring& nameOrPath) {
+    if (nameOrPath.empty()) return {};
+    if (nameOrPath.size() > 2 && nameOrPath[1] == L':')
+        return pathExists(nameOrPath.c_str()) ? nameOrPath : L"";
+    return findOnPath(nameOrPath.c_str());
+}
+
+// Return the filename without extension from a full path.
+static std::wstring exeBaseName(const std::wstring& exePath) {
+    size_t slash = exePath.find_last_of(L"\\/");
+    std::wstring name = (slash != std::wstring::npos) ? exePath.substr(slash + 1) : exePath;
+    size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) name.erase(dot);
+    return name;
+}
+
+// Look up HKCR\Applications\<exe.exe>\FriendlyAppName for a display name.
+static std::wstring getFriendlyNameForExe(const std::wstring& exeFileName) {
+    std::wstring key = L"Applications\\" + exeFileName;
+    HKEY h{};
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, key.c_str(), 0, KEY_READ, &h) != ERROR_SUCCESS) return {};
+    auto name = readRegStr(h, L"FriendlyAppName");
+    RegCloseKey(h);
+    return name;
+}
+
+// Return all applications registered to open files with the given extension (no dot).
+// Results are cached per extension for the lifetime of the DLL.
+static std::vector<OpenWithEntry> queryOpenWith(const std::wstring& ext) {
+    static std::map<std::wstring, std::vector<OpenWithEntry>> s_cache;
+    {
+        auto it = s_cache.find(ext);
+        if (it != s_cache.end()) return it->second;
+    }
+
+    std::vector<OpenWithEntry> results;
+    std::set<std::wstring> seen;
+
+    static const wchar_t* kBlocklist[] = { L"rundll32.exe", L"dllhost.exe", L"msiexec.exe" };
+
+    auto toLower = [](std::wstring s) {
+        for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+        return s;
+    };
+
+    auto isBlocked = [&](const std::wstring& base) {
+        std::wstring l = toLower(base) + L".exe";
+        for (const auto* b : kBlocklist) { if (l == b) return true; }
+        return false;
+    };
+
+    auto addEntry = [&](std::wstring exePath, std::wstring displayName) {
+        if (exePath.empty() || !pathExists(exePath.c_str())) return;
+        std::wstring base = exeBaseName(exePath);
+        if (isBlocked(base)) return;
+        std::wstring key = toLower(exePath);
+        if (seen.count(key)) return;
+        seen.insert(key);
+
+        if (displayName.empty() || toLower(displayName) == L"open") {
+            // Derive from  FriendlyAppName or exe basename
+            size_t sl = exePath.find_last_of(L"\\/");
+            std::wstring exeFile = (sl != std::wstring::npos) ? exePath.substr(sl + 1) : exePath;
+            displayName = getFriendlyNameForExe(exeFile);
+            if (displayName.empty()) displayName = base;
+        }
+        results.push_back({ std::move(displayName), std::move(exePath) });
+    };
+
+    // Resolve exe + display name from a ProgID
+    auto addFromProgId = [&](const std::wstring& progId) {
+        if (progId.empty()) return;
+        std::wstring cmdPath = progId + L"\\shell\\open\\command";
+        HKEY hCmd{};
+        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, cmdPath.c_str(), 0, KEY_READ, &hCmd) != ERROR_SUCCESS) return;
+        std::wstring cmd = readRegStr(hCmd, nullptr);
+        RegCloseKey(hCmd);
+        if (cmd.empty()) return;
+
+        std::wstring exePath = resolveExePath(extractExeFromCommand(cmd));
+
+        // ProgID default value is often the friendly name
+        HKEY hProg{};
+        std::wstring displayName;
+        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, progId.c_str(), 0, KEY_READ, &hProg) == ERROR_SUCCESS) {
+            displayName = readRegStr(hProg, nullptr);
+            RegCloseKey(hProg);
+        }
+        addEntry(std::move(exePath), std::move(displayName));
+    };
+
+    std::wstring extKey = L"." + ext;
+    HKEY hExt{};
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, extKey.c_str(), 0, KEY_READ, &hExt) != ERROR_SUCCESS) {
+        s_cache[ext] = results;
+        return results;
+    }
+
+    // 1. Default ProgID
+    addFromProgId(readRegStr(hExt, nullptr));
+
+    // 2. OpenWithProgids — value names are ProgIDs
+    {
+        HKEY hOwp{};
+        if (RegOpenKeyExW(hExt, L"OpenWithProgids", 0, KEY_READ, &hOwp) == ERROR_SUCCESS) {
+            DWORD idx = 0;
+            wchar_t vName[256]; DWORD vLen = ARRAYSIZE(vName);
+            while (RegEnumValueW(hOwp, idx, vName, &vLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                if (vLen > 0) addFromProgId(vName);
+                ++idx; vLen = ARRAYSIZE(vName);
+            }
+            RegCloseKey(hOwp);
+        }
+    }
+
+    // 3. OpenWithList — sub-key names are exe filenames
+    {
+        HKEY hOwl{};
+        if (RegOpenKeyExW(hExt, L"OpenWithList", 0, KEY_READ, &hOwl) == ERROR_SUCCESS) {
+            DWORD idx = 0;
+            wchar_t subKey[256]; DWORD subLen = ARRAYSIZE(subKey);
+            while (RegEnumKeyExW(hOwl, idx, subKey, &subLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                std::wstring exeName(subKey, subLen);
+                // Try Applications\<exe>\shell\open\command first
+                std::wstring cmdPath = L"Applications\\" + exeName + L"\\shell\\open\\command";
+                HKEY hCmd{};
+                std::wstring exePath;
+                if (RegOpenKeyExW(HKEY_CLASSES_ROOT, cmdPath.c_str(), 0, KEY_READ, &hCmd) == ERROR_SUCCESS) {
+                    exePath = resolveExePath(extractExeFromCommand(readRegStr(hCmd, nullptr)));
+                    RegCloseKey(hCmd);
+                }
+                if (exePath.empty()) exePath = resolveExePath(exeName);
+                addEntry(std::move(exePath), L"");
+                ++idx; subLen = ARRAYSIZE(subKey);
+            }
+            RegCloseKey(hOwl);
+        }
+    }
+
+    RegCloseKey(hExt);
+
+    if (results.size() > 12) results.resize(12); // cap to avoid menu bloat
+    s_cache[ext] = results;
+    return results;
+}
+
 } // namespace
 
 /*
@@ -1201,110 +1385,66 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
         }
 
     } else {
-        // === File contexts — menus adapt to file type and extension ===
+        // === File contexts — dynamically built from Windows file associations ===
         const std::wstring& ext = snapshot.selectedExt;
 
-        switch (kind) {
-            case ContextKind::CodeFile:
-                // Language-specific run actions
-                if (ext == L"py" && !tools.python.empty()) {
-                    addItem(menu, L"Run with Python",       tools.python, L"\"%SEL%\"", tools.python, false, L"Run");
-                    addItem(menu, L"Run as Admin (Python)", tools.python, L"\"%SEL%\"", tools.python, true,  L"Run");
-                }
-                // Editors
-                if (!tools.codeInsiders.empty())
-                    addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders, false, L"Edit");
-                if (!tools.code.empty())
-                    addItem(menu, L"Edit with VS Code",          tools.code,         L"\"%SEL%\"", tools.code,         false, L"Edit");
-                if (!tools.cursor.empty())
-                    addItem(menu, L"Edit with Cursor",           tools.cursor,       L"\"%SEL%\"", tools.cursor,       false, L"Edit");
-                if (!tools.zed.empty())
-                    addItem(menu, L"Edit with Zed",              tools.zed,          L"\"%SEL%\"", tools.zed,          false, L"Edit");
-                if (!tools.sublimeText.empty())
-                    addItem(menu, L"Edit with Sublime Text",     tools.sublimeText,  L"\"%SEL%\"", tools.sublimeText,  false, L"Edit");
-                if (!tools.pycharm.empty() && ext == L"py")
-                    addItem(menu, L"Edit with PyCharm",          tools.pycharm,      L"\"%SEL%\"", L"",                false, L"Edit");
-                if (!tools.notepadPP.empty())
-                    addItem(menu, L"Edit with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP,    false, L"Edit");
-                addItem(menu,     L"Edit with Notepad",          L"notepad.exe",     L"\"%SEL%\"", L"",                false, L"Edit");
-                break;
+        // Query HKCR for all apps registered to open this extension
+        auto openWith = queryOpenWith(ext);
 
-            case ContextKind::TextFile:
-                if (!tools.codeInsiders.empty())
-                    addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
-                if (!tools.sublimeText.empty())
-                    addItem(menu, L"Open with Sublime Text",     tools.sublimeText,  L"\"%SEL%\"", tools.sublimeText);
-                if (!tools.notepadPP.empty())
-                    addItem(menu, L"Open with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
-                addItem(menu,     L"Open with Notepad",          L"notepad.exe",     L"\"%SEL%\"");
-                break;
+        auto toLowerW = [](std::wstring s) {
+            for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+            return s;
+        };
 
-            case ContextKind::ImageFile:
-                addItem(menu, L"Edit with Paint", L"mspaint.exe", L"\"%SEL%\"");
-                if (!tools.codeInsiders.empty())
-                    addItem(menu, L"Open in VS Code", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
-                break;
+        bool hasNotepad = false;
 
-            case ContextKind::ArchiveFile:
-                if (!tools.sevenZip.empty()) {
-                    addItem(menu, L"Extract Here (7-Zip)",         tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\"",      tools.sevenZip);
-                    addItem(menu, L"Extract to Subfolder (7-Zip)", tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\\*\" -y", tools.sevenZip);
-                }
-                addItem(menu, L"Open",  L"%SEL%", L"");
-                break;
+        for (const auto& app : openWith) {
+            std::wstring base = toLowerW(exeBaseName(app.exePath));
 
-            case ContextKind::ExecutableFile:
-                // Run actions — vary by extension
-                if (ext == L"ps1") {
-                    addItem(menu, L"Run in PowerShell",          L"powershell.exe", L"-ExecutionPolicy Bypass -File \"%SEL%\"", L"powershell.exe", false, L"Run");
-                    addItem(menu, L"Run as Admin in PowerShell", L"powershell.exe", L"-ExecutionPolicy Bypass -File \"%SEL%\"", L"powershell.exe", true,  L"Run");
-                } else if (ext == L"bat" || ext == L"cmd") {
-                    addItem(menu, L"Run in CMD",                  L"cmd.exe", L"/c \"%SEL%\"", L"cmd.exe", false, L"Run");
-                    addItem(menu, L"Run as Admin in CMD",         L"cmd.exe", L"/c \"%SEL%\"", L"cmd.exe", true,  L"Run");
-                } else if (ext == L"vbs") {
-                    addItem(menu, L"Run with WScript",  L"wscript.exe", L"\"%SEL%\"", L"", false, L"Run");
-                    addItem(menu, L"Run with CScript",  L"cscript.exe", L"\"%SEL%\"", L"", false, L"Run");
-                } else {
-                    // .exe, .msi, .com, .scr, etc.
-                    addItem(menu, L"Run",         L"%SEL%", L"", L"", false, L"Run");
-                    addItem(menu, L"Run as Admin", L"%SEL%", L"", L"", true,  L"Run");
-                }
-                // Edit actions
-                if (ext == L"ps1" || ext == L"bat" || ext == L"cmd" || ext == L"vbs") {
-                    if (!tools.codeInsiders.empty())
-                        addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders, false, L"Edit");
-                    if (!tools.notepadPP.empty())
-                        addItem(menu, L"Edit with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP,    false, L"Edit");
-                    addItem(menu,     L"Edit with Notepad",          L"notepad.exe",     L"\"%SEL%\"", L"",                false, L"Edit");
-                }
-                break;
+            std::wstring label;
+            if (base == L"python" || base == L"pythonw" || base == L"py") {
+                label = L"Run with Python";
+            } else if (base == L"node") {
+                label = L"Run with Node.js";
+            } else if (base == L"vlc") {
+                label = L"Play with VLC";
+            } else {
+                label = L"Open with " + app.displayName;
+            }
 
-            case ContextKind::MediaFile:
-                if (!tools.vlc.empty())
-                    addItem(menu, L"Play with VLC", tools.vlc, L"\"%SEL%\"", tools.vlc);
-                addItem(menu, L"Open", L"%SEL%", L"");
-                break;
+            addItem(menu, label, app.exePath, L"\"%SEL%\"", app.exePath);
 
-            case ContextKind::DocumentFile:
-                addItem(menu, L"Open", L"%SEL%", L"");
-                if (!tools.codeInsiders.empty())
-                    addItem(menu, L"Edit with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
-                if (!tools.notepadPP.empty())
-                    addItem(menu, L"Edit with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
-                break;
-
-            default:
-                if (!tools.codeInsiders.empty())
-                    addItem(menu, L"Open with VS Code Insiders", tools.codeInsiders, L"\"%SEL%\"", tools.codeInsiders);
-                if (!tools.sublimeText.empty())
-                    addItem(menu, L"Open with Sublime Text",     tools.sublimeText,  L"\"%SEL%\"", tools.sublimeText);
-                if (!tools.notepadPP.empty())
-                    addItem(menu, L"Open with Notepad++",        tools.notepadPP,    L"\"%SEL%\"", tools.notepadPP);
-                addItem(menu,     L"Open with Notepad",          L"notepad.exe",     L"\"%SEL%\"");
-                break;
+            if (base == L"notepad") hasNotepad = true;
         }
 
-        // As Admin for all file contexts
+        // Always provide Notepad as a last-resort text fallback
+        if (!hasNotepad) {
+            addItem(menu, L"Open with Notepad", L"notepad.exe", L"\"%SEL%\"");
+        }
+
+        // Extension-specific workflow actions (beyond the Open With registry)
+        if (ext == L"ps1") {
+            addItem(menu, L"Run in PowerShell",          L"powershell.exe",
+                    L"-ExecutionPolicy Bypass -File \"%SEL%\"", L"powershell.exe", false, L"Run");
+            addItem(menu, L"Run as Admin in PowerShell", L"powershell.exe",
+                    L"-ExecutionPolicy Bypass -File \"%SEL%\"", L"powershell.exe", true,  L"Run");
+        } else if (ext == L"bat" || ext == L"cmd") {
+            addItem(menu, L"Run in CMD",          L"cmd.exe", L"/c \"%SEL%\"", L"cmd.exe", false, L"Run");
+            addItem(menu, L"Run as Admin in CMD", L"cmd.exe", L"/c \"%SEL%\"", L"cmd.exe", true,  L"Run");
+        } else if (ext == L"exe" || ext == L"com" || ext == L"scr") {
+            addItem(menu, L"Run",          L"%SEL%", L"", L"", false, L"Run");
+            addItem(menu, L"Run as Admin", L"%SEL%", L"", L"", true,  L"Run");
+        } else if (ext == L"zip" || ext == L"rar" || ext == L"7z"  || ext == L"tar" ||
+                   ext == L"gz"  || ext == L"bz2" || ext == L"xz"  || ext == L"cab") {
+            if (!tools.sevenZip.empty()) {
+                addItem(menu, L"Extract Here (7-Zip)",
+                        tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\"",       tools.sevenZip, false, L"Extract");
+                addItem(menu, L"Extract to Subfolder (7-Zip)",
+                        tools.sevenZip, L"x \"%SEL%\" -o\"%DIR%\\*\" -y", tools.sevenZip, false, L"Extract");
+            }
+        }
+
+        // As Admin submenu
         {
             Flyout asAdmin{};
             asAdmin.name  = L"AsAdmin";
