@@ -237,7 +237,6 @@ private:
      * but sends relative IDs (e.g., 0) when executing commands. We store relative IDs
      * to fix this mapping issue.
      */
-    UINT m_idBase = 0;                          // Unused legacy field (kept for compatibility)
     UINT m_idCmdFirst = 0;                      // Base ID assigned by Windows (used for relative ID calculation)
     std::map<UINT, std::vector<UINT>> m_idToPath; // Maps menu command ID -> path to flyout/item
                                                // Path format: [flyoutIdx, itemIdx, isItem(0)/isSubflyout(1)]
@@ -252,9 +251,7 @@ private:
      */
     void loadConfig();                          // Main entry point - orchestrates hybrid loading strategy
     void loadRegistryFilesAsSeparateFlyouts();   // Load menus from .reg files without external processes
-    void createCompleteAwesomeMenu();           // LEGACY: Static AwesomeMenu with unlimited "As Admin" submenu
     Flyout createContextAwareAwesomeMenu(const ContextSnapshot& snapshot); // Dynamic context-aware AwesomeMenu
-    void createUnlimitedTestMenu();             // DEVELOPMENT: Test menu for validation
 
     /*
      * Registry File Parsing System
@@ -262,8 +259,7 @@ private:
      * Converts Windows .reg files into our internal Flyout structure.
      * Supports standard Windows registry syntax for shell extensions.
      */
-    void parseRegistryFile(const std::wstring& filePath, Flyout& targetFlyout);       // LEGACY: Complex parser
-    void parseRegistryFileSimplified(const std::wstring& filePath, Flyout& targetFlyout); // NEW: Simplified parser
+    void parseRegistryFileSimplified(const std::wstring& filePath, Flyout& targetFlyout);
     std::wstring getMenusFolder() const;        // Get %APPDATA%\AwesomeMenuHost\menus\ path
     bool applyRegistryFile(const std::wstring& fullPath, const std::wstring& fileKey,
                            std::vector<std::pair<std::wstring, std::wstring>>& recordedEntries);
@@ -271,19 +267,6 @@ private:
                                      const std::vector<std::pair<std::wstring, std::wstring>>& entries);
     void removeManagedEntriesForFile(const std::wstring& fileKey);
     void purgeMissingRegistryFiles(const std::set<std::wstring>& currentFiles);
-
-    /*
-     * Legacy Registry Parsing (Original Implementation)
-     * =================================================
-     * These methods parse existing Windows registry entries (HKCR\Directory\shell\AwesomeMenu).
-     * Used as fallback when registry files are not available.
-     */
-    void loadAndConvertShellExtensions();       // Load from live Windows registry
-    void parseAwesomeMenuStructure(HKEY hAwesomeMenu);           // Parse main AwesomeMenu key
-    void parseSubCommands(const std::wstring& subCommands,       // Parse SubCommands value (cascading structure)
-                         const std::wstring& basePath, Flyout& flyout);
-    void parseDirectCommand(const std::wstring& command,         // Parse individual command entry
-                           const std::wstring& basePath, Flyout& flyout);
 
     /*
      * Menu Execution System
@@ -307,9 +290,7 @@ private:
      * These methods build unlimited cascading menus programmatically,
      * bypassing Windows' 16-item registry parsing limitations.
      */
-    UINT buildCascadingMenu(HMENU hMenu, const Flyout& flyout,      // Legacy menu builder
-                           UINT& idNext, std::vector<UINT>& currentPath);
-    UINT buildCascadingMenuFixed(HMENU hParentMenu,                 // Fixed menu builder with proper ID mapping
+    UINT buildCascadingMenuFixed(HMENU hParentMenu,
                                 const Flyout& flyout, UINT& idNext,
                                 std::vector<UINT>& currentPath, UINT idCmdFirst,
                                 UINT insertAt = UINT_MAX);          // UINT_MAX = append

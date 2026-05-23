@@ -41,7 +41,6 @@
 #include <algorithm>         // std::transform for string manipulation
 #include <format>            // std::format for structured logging
 #include <cwctype>           // Character casing helpers
-#include <set>               // Track managed registry files
 #include <sstream>           // String composition helpers
 #include <cstring>           // memcpy for registry value buffers
 #include <cstdlib>           // wcstoul helpers
@@ -177,13 +176,8 @@ struct ParsedRegValue {
 };
 
 void ensureWideNullTerminator(std::vector<BYTE>& buffer) {
-    if (buffer.size() % sizeof(wchar_t) != 0) {
-        buffer.push_back(0);
-    }
-    if (buffer.size() % sizeof(wchar_t) != 0) {
-        buffer.push_back(0);
-    }
-
+    if (buffer.size() % sizeof(wchar_t) != 0)
+        buffer.push_back(0); // pad to wchar_t boundary
     const wchar_t* chars = reinterpret_cast<const wchar_t*>(buffer.data());
     size_t length = buffer.size() / sizeof(wchar_t);
     if (length == 0 || chars[length - 1] != L'\0') {
@@ -1280,46 +1274,6 @@ IFACEMETHODIMP AwesomeMenuHost::Initialize(PCIDLIST_ABSOLUTE pidlFolder, IDataOb
     }
 }
 
-/*
- * Registry Reading Helper Function
- * ================================
- * Safe wrapper for reading string values from Windows registry.
- * Used for parsing existing shell extension registry entries.
- *
- * SECURITY FEATURES:
- * - Validates data type (REG_SZ or REG_EXPAND_SZ only)
- * - Prevents excessive memory allocation (32KB limit)
- * - Ensures proper null termination
- * - Handles variable-length registry strings safely
- *
- * RETURN: Registry string value, or empty string if error/not found
- */
-static std::wstring RegReadSz(HKEY hKey, const wchar_t* name) {
-    DWORD type = 0; DWORD cb = 0;
-
-    // First query: get data type and size
-    if (RegQueryValueExW(hKey, name, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS) return L"";
-
-    // SECURITY: Only accept string types
-    if (type != REG_SZ && type != REG_EXPAND_SZ) return L"";
-
-    // SECURITY: Prevent huge allocations (32KB limit)
-    if (cb == 0 || cb > 32768) return L"";
-
-    // Allocate string buffer with safety margin
-    std::wstring s;
-    s.resize((cb / sizeof(wchar_t)) + 1);     // Extra space for safety
-
-    // Second query: get actual data
-    DWORD actualSize = cb;
-    if (RegQueryValueExW(hKey, name, nullptr, &type, (LPBYTE)s.data(), &actualSize) != ERROR_SUCCESS) return L"";
-
-    // SECURITY: Ensure proper null termination and remove trailing nulls
-    s.resize(actualSize / sizeof(wchar_t));
-    while (!s.empty() && s.back() == L'\0') s.pop_back();
-
-    return s;
-}
 
 /*
  * Hybrid Menu Configuration Loading System
@@ -1341,46 +1295,13 @@ static std::wstring RegReadSz(HKEY hKey, const wchar_t* name) {
  * RESULT: Best of both worlds - reliable core functionality + unlimited extensibility
  */
 void AwesomeMenuHost::loadConfig() {
-    logDebug(L"loadConfig() starting - HYBRID SYSTEM", LogCategory::Menu);
-    m_flyouts.clear();                    // Start with empty menu configuration
+    m_flyouts.clear();
     m_activeFlyouts.clear();
-
-    // NOTE: AwesomeMenu will be created dynamically based on context in QueryContextMenu
-    // This ensures the menu content changes based on what the user right-clicked
-
-    logDebug(std::format(L"After AwesomeMenu creation, flyouts count: {}", m_flyouts.size()), LogCategory::Menu);
-
-    // THEN: Add registry files as separate flyouts
     try {
-        logDebug(L"Loading registry files as separate flyouts...", LogCategory::Registry);
-        loadRegistryFilesAsSeparateFlyouts(); // Each .reg file becomes its own flyout
-
-        logDebug(std::format(L"After registry files, total flyouts count: {}", m_flyouts.size()), LogCategory::Registry);
+        loadRegistryFilesAsSeparateFlyouts();
     } catch (...) {
         logDebug(L"Exception in loadRegistryFilesAsSeparateFlyouts", LogCategory::Error);
-        // If registry file loading fails, continue - AwesomeMenu is still available
-        // This ensures robustness while maintaining core functionality
     }
-
-    // EMERGENCY: Ultimate fallback if AwesomeMenu creation fails
-    // if (m_flyouts.empty()) {
-    //     // Create minimal emergency menu to ensure something always appears
-    //     Flyout f{};
-    //     f.name = L"Emergency";
-    //     f.label = L"Awesome Menu";
-    //     f.showIn = L"background;directory";
-
-    //     f.items.push_back(FlyoutItem{
-    //         .label = L"Open Terminal Here (Admin)",
-    //         .command = L"wt.exe",
-    //         .args = L"",
-    //         .icon = L"",
-    //         .workingDir = m_context.contextDir,
-    //         .runAs = true,
-    //         .section = L""
-    //     });
-    //     m_flyouts.push_back(std::move(f));
-    // }
 }
 
 ContextSnapshot AwesomeMenuHost::buildContextSnapshot(PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pdtobj) {
@@ -1456,14 +1377,6 @@ ContextKind AwesomeMenuHost::detectContextKind(const ContextSnapshot& snapshot) 
     }
 
     return ContextKind::Background;
-}
-
-void AwesomeMenuHost::createUnlimitedTestMenu() {
-    // Retired — superseded by createContextAwareAwesomeMenu()
-}
-
-void AwesomeMenuHost::createCompleteAwesomeMenu() {
-    // Retired — superseded by createContextAwareAwesomeMenu()
 }
 
 Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& snapshot) {
@@ -1704,12 +1617,7 @@ UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hM
     m_idToPath.clear();
 
     auto containsCase = [](const std::wstring& hay, const wchar_t* needle) {
-        if (hay.empty() || !needle) return false;
-        std::wstring h = hay;
-        for (auto& ch : h) ch = towlower(ch);
-        std::wstring n = needle;
-        for (auto& ch : n) ch = towlower(ch);
-        return h.find(n) != std::wstring::npos;
+        return StrStrIW(hay.c_str(), needle) != nullptr;
     };
 
     auto matchShowIn = [&](const std::wstring& show) {
@@ -1786,17 +1694,8 @@ UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hM
  *   - Hot-reloadable by restarting Explorer or re-registering extension
  */
 std::wstring AwesomeMenuHost::getMenusFolder() const {
-    PWSTR appDataPath = nullptr;
-
-    // Get user's roaming AppData folder path using modern Windows API
-    if (SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appDataPath) == S_OK) {
-        std::wstring menusPath = appDataPath;
-        CoTaskMemFree(appDataPath);           // Free COM-allocated memory
-        menusPath += L"\\AwesomeMenuHost\\menus"; // Append our specific subfolder
-        return menusPath;
-    }
-
-    return L"";                               // Fallback if AppData path unavailable
+    std::wstring p = getKnownFolder(FOLDERID_RoamingAppData);
+    return p.empty() ? L"" : p + L"\\AwesomeMenuHost\\menus";
 }
 
 /*
@@ -1886,128 +1785,6 @@ void AwesomeMenuHost::loadRegistryFilesAsSeparateFlyouts() {
     purgeMissingRegistryFiles(currentFiles);
 }
 
-/*
- * Registry File Parser
- * ====================
- * Parses Windows .reg files to extract shell extension menu definitions.
- * Supports standard Windows Registry Editor export format with shell commands.
- *
- * SUPPORTED REGISTRY STRUCTURE:
- * [HKEY_CLASSES_ROOT\Directory\shell\MenuName]
- * "MUIVerb"="Display Name"
- * "Icon"="executable.exe"
- * "HasLUAShield"=dword:00000001
- *
- * [HKEY_CLASSES_ROOT\Directory\shell\MenuName\command]
- * @="command to execute"
- *
- * PARSING FEATURES:
- * - Handles Unicode BOM characters
- * - Extracts display labels, commands, icons, and elevation requirements
- * - Supports both MUIVerb and default value labels
- * - Automatically sets working directory to %DIR% placeholder
- * - Groups related commands into single flyout structure
- *
- * ERROR HANDLING:
- * - Gracefully handles malformed registry syntax
- * - Skips invalid entries and continues parsing
- * - Ensures safe string operations with bounds checking
- */
-void AwesomeMenuHost::parseRegistryFile(const std::wstring& filePath, Flyout& targetFlyout) {
-    // Open registry file for reading (Unicode support)
-    std::wifstream file(filePath);
-    if (!file.is_open()) return;              // File not accessible
-
-    // Parser state variables
-    std::wstring line;
-    std::wstring currentKey;
-    FlyoutItem currentItem;
-    bool inShellKey = false;                  // Track if we're in a shell command key
-    std::wstring currentLabel;
-
-    // Parse file line by line
-    while (std::getline(file, line)) {
-        // Remove Unicode BOM (Byte Order Mark) if present
-        if (!line.empty() && line[0] == 0xFEFF) {
-            line = line.substr(1);
-        }
-
-        // Trim whitespace from both ends
-        size_t start = line.find_first_not_of(L" \t\r\n");
-        if (start != std::wstring::npos) {
-            size_t end = line.find_last_not_of(L" \t\r\n");
-            line = line.substr(start, end - start + 1);
-        } else {
-            line.clear();
-        }
-
-        // Skip empty lines and comments (lines starting with semicolon)
-        if (line.empty() || line[0] == L';') continue;
-
-        // Parse registry key sections [HKEY_CLASSES_ROOT\...]
-        if (line[0] == L'[' && line.back() == L']') {
-            // Save previous item if we have complete information
-            if (inShellKey && !currentLabel.empty() && !currentItem.command.empty()) {
-                currentItem.label = currentLabel;
-                targetFlyout.items.push_back(std::move(currentItem));
-                currentItem = {};             // Reset for next item
-                currentLabel.clear();
-            }
-
-            // Extract key path (remove brackets)
-            currentKey = line.substr(1, line.length() - 2);
-
-            // Determine if this is a shell command key (not a \command subkey)
-            inShellKey = (currentKey.find(L"\\shell\\") != std::wstring::npos) &&
-                        (currentKey.find(L"\\command") == std::wstring::npos);
-        }
-        // Parse registry value assignments (name=value)
-        else if (line.find(L'=') != std::wstring::npos) {
-            size_t equalPos = line.find(L'=');
-            std::wstring valueName = line.substr(0, equalPos);
-            std::wstring valueData = line.substr(equalPos + 1);
-
-            // Remove quotes from value name and data
-            if (!valueName.empty() && valueName[0] == L'"' && valueName.back() == L'"') {
-                valueName = valueName.substr(1, valueName.length() - 2);
-            }
-            if (!valueData.empty() && valueData[0] == L'"' && valueData.back() == L'"') {
-                valueData = valueData.substr(1, valueData.length() - 2);
-            }
-
-            // Extract shell command information based on value name
-            if (inShellKey) {
-                if (valueName == L"MUIVerb" || valueName.empty()) {
-                    // Handle command vs label distinction
-                    if (valueName.empty() && currentKey.find(L"\\command") != std::wstring::npos) {
-                        // This is the command to execute (default value of command key)
-                        currentItem.command = valueData;
-                        currentItem.workingDir = L"%DIR%"; // Set context directory placeholder
-                    } else {
-                        // This is the display label (MUIVerb or default value)
-                        currentLabel = valueData;
-                    }
-                }
-                else if (valueName == L"Icon") {
-                    // Icon specification (usually executable path)
-                    currentItem.icon = valueData;
-                }
-                else if (valueName == L"HasLUAShield") {
-                    // UAC elevation shield indicator
-                    currentItem.runAs = true;
-                }
-            }
-        }
-    }
-
-    // Save the final item if we have complete information
-    if (inShellKey && !currentLabel.empty() && !currentItem.command.empty()) {
-        currentItem.label = currentLabel;
-        targetFlyout.items.push_back(std::move(currentItem));
-    }
-
-    file.close();                             // Close file handle
-}
 
 /*
  * Simplified Registry File Parser for Separate Flyouts
@@ -2040,21 +1817,8 @@ void AwesomeMenuHost::parseRegistryFileSimplified(const std::wstring& filePath, 
 
     // Parse file line by line with simplified logic
     while (std::getline(file, line)) {
-        // Remove Unicode BOM and trim whitespace
-        if (!line.empty() && line[0] == 0xFEFF) {
-            line = line.substr(1);
-        }
-
-        // Trim whitespace
-        size_t start = line.find_first_not_of(L" \t\r\n");
-        if (start != std::wstring::npos) {
-            size_t end = line.find_last_not_of(L" \t\r\n");
-            line = line.substr(start, end - start + 1);
-        } else {
-            line.clear();
-        }
-
-        // Skip empty lines and comments
+        if (!line.empty() && line[0] == 0xFEFF) line.erase(line.begin());
+        trimInPlace(line);
         if (line.empty() || line[0] == L';') continue;
 
         // Parse registry key sections [HKEY_...]
@@ -2130,201 +1894,12 @@ void AwesomeMenuHost::parseRegistryFileSimplified(const std::wstring& filePath, 
         }
     }
 
-    // Add all completed items to the flyout
-    for (const auto& pair : pendingItems) {
-        const FlyoutItem& item = pair.second;
-        // Only add items that have both label and command
-        if (!item.label.empty() && !item.command.empty()) {
+    for (const auto& [key, item] : pendingItems) {
+        if (!item.label.empty() && !item.command.empty())
             targetFlyout.items.push_back(item);
-        }
-    }
-
-    file.close();                             // Close file handle
-}
-
-void AwesomeMenuHost::loadAndConvertShellExtensions() {
-    HKEY hAwesomeMenu{};
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"Directory\\shell\\AwesomeMenu", 0, KEY_READ, &hAwesomeMenu) == ERROR_SUCCESS) {
-        parseAwesomeMenuStructure(hAwesomeMenu);
-        RegCloseKey(hAwesomeMenu);
     }
 }
 
-void AwesomeMenuHost::parseAwesomeMenuStructure(HKEY hAwesomeMenu) {
-    // Create a flyout for AwesomeMenu
-    Flyout flyout{};
-    flyout.name = L"AwesomeMenu";
-    flyout.label = RegReadSz(hAwesomeMenu, L"MUIVerb");
-    if (flyout.label.empty()) {
-        flyout.label = L"Awesome Menu";
-    }
-    flyout.showIn = L"background;directory"; // Default for Directory\shell entries
-
-    // Read SubCommands to parse the hierarchical structure
-    std::wstring subCommands = RegReadSz(hAwesomeMenu, L"SubCommands");
-    if (!subCommands.empty()) {
-        parseSubCommands(subCommands, L"Directory\\shell\\AwesomeMenu", flyout);
-    }
-
-    // Add the flyout if it has items
-    if (!flyout.items.empty()) {
-        m_flyouts.push_back(std::move(flyout));
-    }
-}
-
-void AwesomeMenuHost::parseSubCommands(const std::wstring& subCommands, const std::wstring& basePath, Flyout& flyout) {
-    // Split SubCommands by semicolon
-    std::wstring commands = subCommands;
-    size_t pos = 0;
-
-    while (pos < commands.length() && pos < 10000) { // Prevent excessive processing
-        size_t nextPos = commands.find(L';', pos);
-        if (nextPos == std::wstring::npos) nextPos = commands.length();
-
-        if (nextPos <= pos || (nextPos - pos) > 1000) { // Prevent huge substrings
-            pos = nextPos + 1;
-            continue;
-        }
-
-        std::wstring command = commands.substr(pos, nextPos - pos);
-
-        // Remove whitespace safely
-        size_t start = command.find_first_not_of(L" \t");
-        if (start != std::wstring::npos) {
-            size_t end = command.find_last_not_of(L" \t");
-            if (end != std::wstring::npos && end >= start) {
-                command = command.substr(start, end - start + 1);
-            } else {
-                command.clear();
-            }
-        } else {
-            command.clear();
-        }
-
-        if (!command.empty()) {
-            // For top-level SubCommands like "AwesomeMenu.AsAdmin", check if it's a section with nested commands
-            size_t firstDot = command.find(L'.');
-            if (firstDot != std::wstring::npos) {
-                size_t secondDot = command.find(L'.', firstDot + 1);
-
-                if (secondDot == std::wstring::npos) {
-                    // This is a section (e.g., "AwesomeMenu.AsAdmin"), check for nested SubCommands
-                    std::wstring sectionName = command.substr(firstDot + 1);
-                    std::wstring sectionPath = basePath + L"\\shell\\" + sectionName;
-
-                    HKEY hSection{};
-                    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, sectionPath.c_str(), 0, KEY_READ, &hSection) == ERROR_SUCCESS) {
-                        std::wstring nestedSubCommands = RegReadSz(hSection, L"SubCommands");
-                        if (!nestedSubCommands.empty()) {
-                            // Recursively parse nested SubCommands
-                            parseSubCommands(nestedSubCommands, sectionPath, flyout);
-                        }
-                        RegCloseKey(hSection);
-                    }
-                } else {
-                    // This is a direct command (e.g., "AwesomeMenu.AsAdmin.CMD")
-                    parseDirectCommand(command, basePath, flyout);
-                }
-            }
-        }
-
-        pos = nextPos + 1;
-    }
-}
-
-void AwesomeMenuHost::parseDirectCommand(const std::wstring& command, const std::wstring& basePath, Flyout& flyout) {
-    // Extract the section and command name from "AwesomeMenu.AsAdmin.CMD"
-    size_t lastDot = command.find_last_of(L'.');
-    std::wstring commandName = (lastDot != std::wstring::npos) ? command.substr(lastDot + 1) : command;
-
-    // Find the section (second-to-last part)
-    std::wstring section;
-    if (lastDot != std::wstring::npos) {
-        size_t secondLastDot = command.find_last_of(L'.', lastDot - 1);
-        if (secondLastDot != std::wstring::npos) {
-            section = command.substr(secondLastDot + 1, lastDot - secondLastDot - 1);
-        }
-    }
-
-    // Build registry path for this command
-    // Convert "AwesomeMenu.AsAdmin.CMD" to "Directory\shell\AwesomeMenu\shell\AsAdmin\shell\CMD"
-    std::wstring cmdPath = L"Directory\\shell\\AwesomeMenu\\shell";
-    size_t dotPos = command.find(L'.', command.find(L'.') + 1); // Skip first dot (AwesomeMenu.)
-    int pathDepth = 0; // Prevent excessive nesting
-    while (dotPos != std::wstring::npos && pathDepth < 10) {
-        size_t nextDot = command.find(L'.', dotPos + 1);
-        if (dotPos + 1 >= command.length()) break; // Prevent out of bounds
-
-        size_t partLen = (nextDot != std::wstring::npos) ? nextDot - dotPos - 1 : command.length() - dotPos - 1;
-        if (partLen > 0 && partLen < 256) { // Reasonable part length
-            std::wstring part = command.substr(dotPos + 1, partLen);
-            if (cmdPath.length() + part.length() + 10 < 2000) { // Prevent excessive path length
-                cmdPath += L"\\" + part;
-                if (nextDot != std::wstring::npos) {
-                    cmdPath += L"\\shell";
-                }
-            }
-        }
-        dotPos = nextDot;
-        pathDepth++;
-    }
-
-    // Read the command details from registry
-    HKEY hCommand{};
-    std::wstring commandKeyPath = cmdPath + L"\\command";
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, commandKeyPath.c_str(), 0, KEY_READ, &hCommand) == ERROR_SUCCESS) {
-        FlyoutItem item{};
-
-        // Get the label from the parent key's MUIVerb
-        HKEY hParent{};
-        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, cmdPath.c_str(), 0, KEY_READ, &hParent) == ERROR_SUCCESS) {
-            item.label = RegReadSz(hParent, L"MUIVerb");
-            if (item.label.empty()) {
-                item.label = commandName; // Fallback to command name
-            }
-            item.icon = RegReadSz(hParent, L"Icon");
-            RegCloseKey(hParent);
-        }
-
-        // Get the command string (default value)
-        std::wstring fullCommand = RegReadSz(hCommand, L"");
-        if (!fullCommand.empty() && fullCommand.length() < 2000) { // Reasonable command length
-            // Parse the command - handle PowerShell wrapping if present
-            if (fullCommand.find(L"powershell.exe") == 0) {
-                // Extract actual command from PowerShell wrapper
-                // "powershell.exe -Command "Start-Process 'cmd.exe' -Verb RunAs -WorkingDirectory '%1'""
-                size_t startQuote = fullCommand.find(L"Start-Process '");
-                if (startQuote != std::wstring::npos && startQuote < fullCommand.length() - 15) {
-                    startQuote += 15; // Length of "Start-Process '"
-                    size_t endQuote = fullCommand.find(L"'", startQuote);
-                    if (endQuote != std::wstring::npos && endQuote > startQuote && (endQuote - startQuote) < 1000) {
-                        item.command = fullCommand.substr(startQuote, endQuote - startQuote);
-
-                        // Check for RunAs
-                        if (fullCommand.find(L"-Verb RunAs") != std::wstring::npos) {
-                            item.runAs = true;
-                        }
-
-                        // Set working directory placeholder
-                        item.workingDir = L"%DIR%";
-                    }
-                }
-            } else {
-                // Direct command
-                item.command = fullCommand;
-                item.workingDir = L"%DIR%";
-            }
-
-            item.section = section;
-
-            if (!item.label.empty() && !item.command.empty()) {
-                flyout.items.push_back(std::move(item));
-            }
-        }
-
-        RegCloseKey(hCommand);
-    }
-}
 
 /*
  * Placeholder Expansion System
@@ -2526,13 +2101,8 @@ IFACEMETHODIMP AwesomeMenuHost::QueryContextMenu(HMENU hMenu, UINT indexMenu, UI
  */
 IFACEMETHODIMP AwesomeMenuHost::InvokeCommand(LPCMINVOKECOMMANDINFO pici) {
     try {
-        if (!pici) return E_INVALIDARG;         // Null parameter check
+        if (!pici) return E_INVALIDARG;
 
-        // Detect Unicode vs ANSI command info structure
-        bool isUnicode = (pici->cbSize == sizeof(CMINVOKECOMMANDINFOEX)) &&
-                        (pici->fMask & CMIC_MASK_UNICODE);
-
-        // Handle numeric command IDs (standard menu item clicks)
         if (!HIWORD(pici->lpVerb)) {
             UINT id = LOWORD(pici->lpVerb);     // Extract command ID
 
@@ -2555,9 +2125,7 @@ IFACEMETHODIMP AwesomeMenuHost::InvokeCommand(LPCMINVOKECOMMANDINFO pici) {
             // Command ID not found in mapping
             return E_FAIL;
         } else {
-            // String verbs not implemented (we only use numeric IDs)
-            (void)isUnicode;                    // Suppress unused variable warning
-            return E_FAIL;
+            return E_FAIL; // string verbs not implemented
         }
     } catch (...) {
         // CRITICAL: Never let C++ exceptions escape from COM interface methods
@@ -2598,88 +2166,6 @@ IFACEMETHODIMP AwesomeMenuHost::HandleMenuMsg2(UINT uMsg, WPARAM wParam, LPARAM 
     return S_OK;
 }
 
-UINT AwesomeMenuHost::buildCascadingMenu(HMENU hParentMenu, const Flyout& flyout, UINT& idNext, std::vector<UINT>& currentPath) {
-    // Create submenu for this flyout
-    HMENU hSubMenu = CreatePopupMenu();
-    if (!hSubMenu) return 0;
-
-    UINT menuIndex = 0;
-
-    // Add all direct items first
-    std::wstring lastSection;
-    for (size_t i = 0; i < flyout.items.size(); ++i) {
-        const auto& item = flyout.items[i];
-
-        // Add section separator if different from last section
-        if (!item.section.empty() && i > 0 && _wcsicmp(item.section.c_str(), lastSection.c_str()) != 0) {
-            MENUITEMINFOW sep{};
-            sep.cbSize = sizeof(sep);
-            sep.fMask = MIIM_FTYPE;
-            sep.fType = MFT_SEPARATOR;
-            InsertMenuItemW(hSubMenu, menuIndex++, TRUE, &sep);
-        }
-
-        // Create menu item with icon support
-        MENUITEMINFOW mi{};
-        mi.cbSize = sizeof(mi);
-        mi.fMask = MIIM_ID | MIIM_STRING;
-        mi.wID = idNext;
-        mi.dwTypeData = const_cast<LPWSTR>(item.label.c_str());
-
-        if (!item.icon.empty()) {
-            HBITMAP hIcon = hbitmapFromIconSpec(item.icon, GetSystemMetrics(SM_CXSMICON));
-            if (hIcon) { mi.fMask |= MIIM_BITMAP; mi.hbmpItem = hIcon; m_menuBitmaps.push_back(hIcon); }
-        }
-
-        InsertMenuItemW(hSubMenu, menuIndex++, TRUE, &mi);
-
-        // Store path to this item - DEBUG: log what we're storing
-        std::vector<UINT> itemPath = currentPath;
-        itemPath.push_back((UINT)i); // item index
-        itemPath.push_back(0); // 0 = item (not subflyout)
-
-        // DEBUG: Show what ID we're storing
-    std::wstring storeMsg = L"STORING: ID=" + std::to_wstring(mi.wID) + L" for item: " + item.label;
-    logDebug(storeMsg, LogCategory::Menu);
-
-        m_idToPath[mi.wID] = itemPath; // Store using the actual menu ID!
-        idNext++;
-
-        lastSection = item.section;
-    }
-
-    // Add cascading submenus for nested flyouts
-    for (size_t s = 0; s < flyout.subFlyouts.size(); ++s) {
-        const auto& subFlyout = flyout.subFlyouts[s];
-
-        // Add separator before submenus if we have items
-        if (!flyout.items.empty() && s == 0) {
-            MENUITEMINFOW sep{};
-            sep.cbSize = sizeof(sep);
-            sep.fMask = MIIM_FTYPE;
-            sep.fType = MFT_SEPARATOR;
-            InsertMenuItemW(hSubMenu, menuIndex++, TRUE, &sep);
-        }
-
-        // Create path for submenu
-        std::vector<UINT> subPath = currentPath;
-        subPath.push_back((UINT)s); // subflyout index
-        subPath.push_back(1); // 1 = subflyout
-
-        // Recursively build the cascading submenu
-        buildCascadingMenu(hSubMenu, subFlyout, idNext, subPath);
-    }
-
-    // Add this submenu to parent menu
-    MENUITEMINFOW root{};
-    root.cbSize = sizeof(root);
-    root.fMask = MIIM_STRING | MIIM_SUBMENU;
-    root.hSubMenu = hSubMenu;
-    root.dwTypeData = const_cast<LPWSTR>(flyout.label.c_str());
-    InsertMenuItemW(hParentMenu, GetMenuItemCount(hParentMenu), TRUE, &root);
-
-    return menuIndex;
-}
 
 /*
  * Fixed Cascading Menu Builder
