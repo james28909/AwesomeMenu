@@ -1391,30 +1391,11 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
         // Query HKCR for all apps registered to open this extension
         auto openWith = queryOpenWith(ext);
 
-        auto toLowerW = [](std::wstring s) {
-            for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
-            return s;
-        };
-
         bool hasNotepad = false;
 
         for (const auto& app : openWith) {
-            std::wstring base = toLowerW(exeBaseName(app.exePath));
-
-            std::wstring label;
-            if (base == L"python" || base == L"pythonw" || base == L"py") {
-                label = L"Run with Python";
-            } else if (base == L"node") {
-                label = L"Run with Node.js";
-            } else if (base == L"vlc") {
-                label = L"Play with VLC";
-            } else {
-                label = L"Open with " + app.displayName;
-            }
-
-            addItem(menu, label, app.exePath, L"\"%SEL%\"", app.exePath);
-
-            if (base == L"notepad") hasNotepad = true;
+            addItem(menu, L"Open with " + app.displayName, app.exePath, L"\"%SEL%\"", app.exePath);
+            if (_wcsicmp(exeBaseName(app.exePath).c_str(), L"notepad") == 0) hasNotepad = true;
         }
 
         // Always provide Notepad as a last-resort text fallback
