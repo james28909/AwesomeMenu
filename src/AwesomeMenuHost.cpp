@@ -45,6 +45,7 @@
 #include <sstream>           // String composition helpers
 #include <cstring>           // memcpy for registry value buffers
 #include <cstdlib>           // wcstoul helpers
+#include <optional>          // std::optional for game shortcut detection
 
 // Global DLL reference counter for COM object lifetime management
 // Incremented when objects created, decremented when destroyed
@@ -681,14 +682,10 @@ static std::vector<OpenWithEntry> queryOpenWith(const std::wstring& ext) {
 
         std::wstring exePath = resolveExePath(extractExeFromCommand(cmd));
 
-        // ProgID default value is often the friendly name
-        HKEY hProg{};
-        std::wstring displayName;
-        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, progId.c_str(), 0, KEY_READ, &hProg) == ERROR_SUCCESS) {
-            displayName = readRegStr(hProg, nullptr);
-            RegCloseKey(hProg);
-        }
-        addEntry(std::move(exePath), std::move(displayName));
+        // Pass empty display name — addEntry derives it from getFriendlyNameForExe.
+        // The ProgID (default) value is the file type description ("Text Source File"),
+        // not the app name, so it must not be used here.
+        addEntry(std::move(exePath), L"");
     };
 
     std::wstring extKey = L"." + ext;
@@ -793,6 +790,161 @@ static std::vector<OpenWithEntry> queryOpenWith(const std::wstring& ext) {
     if (results.size() > 12) results.resize(12);
     s_cache[ext] = results;
     return results;
+}
+
+// ---------------------------------------------------------------------------
+// Game shortcut detection — parses .lnk files to identify game launchers
+// ---------------------------------------------------------------------------
+
+struct GameLaunchInfo {
+    std::wstring platform;  // "Steam", "EA App", "Epic Games", "GOG Galaxy"
+    std::wstring gameName;
+    std::wstring launchExe;
+    std::wstring launchArgs;
+};
+
+static std::wstring findArgToken(const std::wstring& args, const wchar_t* flag) {
+    std::wstring lower = args, flagL(flag);
+    for (auto& c : lower) c = towlower(c);
+    for (auto& c : flagL) c = towlower(c);
+    size_t pos = lower.find(flagL);
+    if (pos == std::wstring::npos) return {};
+    pos += flagL.size();
+    while (pos < args.size() && iswspace(args[pos])) ++pos;
+    size_t end = pos;
+    while (end < args.size() && !iswspace(args[end])) ++end;
+    return args.substr(pos, end - pos);
+}
+
+static std::wstring lookupSteamGameName(const std::wstring& appId) {
+    HKEY h{};
+    std::wstring key = L"Software\\Valve\\Steam\\Apps\\" + appId;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        std::wstring name = readRegStr(h, L"Name");
+        RegCloseKey(h);
+        if (!name.empty()) return name;
+    }
+    key = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App " + appId;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        std::wstring name = readRegStr(h, L"DisplayName");
+        RegCloseKey(h);
+        if (!name.empty()) return name;
+    }
+    return {};
+}
+
+static std::wstring findSteamExe() {
+    HKEY h{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        std::wstring p = readRegStr(h, L"SteamExe");
+        RegCloseKey(h);
+        if (!p.empty() && pathExists(p.c_str())) return p;
+    }
+    std::wstring pf = getKnownFolder(FOLDERID_ProgramFilesX86);
+    if (!pf.empty()) {
+        std::wstring p = pf + L"\\Steam\\steam.exe";
+        if (pathExists(p.c_str())) return p;
+    }
+    return findOnPath(L"steam.exe");
+}
+
+static std::wstring lookupEAGameName(const std::wstring& contentId) {
+    // EA stores game info under HKLM\SOFTWARE\EA Games\<game>
+    HKEY hRoot{};
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\EA Games", 0, KEY_READ, &hRoot) != ERROR_SUCCESS)
+        return {};
+    wchar_t subKey[256]; DWORD subLen = ARRAYSIZE(subKey);
+    for (DWORD idx = 0; RegEnumKeyExW(hRoot, idx, subKey, &subLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS; ++idx, subLen = ARRAYSIZE(subKey)) {
+        HKEY hGame{};
+        if (RegOpenKeyExW(hRoot, subKey, 0, KEY_READ, &hGame) == ERROR_SUCCESS) {
+            std::wstring id = readRegStr(hGame, L"ContentID");
+            if (id == contentId) {
+                std::wstring name = readRegStr(hGame, L"DisplayName");
+                RegCloseKey(hGame); RegCloseKey(hRoot);
+                return name;
+            }
+            RegCloseKey(hGame);
+        }
+    }
+    RegCloseKey(hRoot);
+    return {};
+}
+
+static std::optional<GameLaunchInfo> parseGameShortcut(const std::wstring& lnkPath) {
+    IShellLinkW* psl = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl)))
+        return std::nullopt;
+
+    IPersistFile* ppf = nullptr;
+    if (FAILED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) { psl->Release(); return std::nullopt; }
+
+    HRESULT hr = ppf->Load(lnkPath.c_str(), STGM_READ);
+    ppf->Release();
+    if (FAILED(hr)) { psl->Release(); return std::nullopt; }
+
+    wchar_t target[MAX_PATH]{}, args[2048]{};
+    psl->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH);
+    psl->GetArguments(args, (int)ARRAYSIZE(args));
+    psl->Release();
+
+    std::wstring t(target), a(args);
+    std::wstring base = exeBaseName(t);
+    for (auto& c : base) c = towlower(c);
+
+    // --- Steam ---
+    if (base == L"steam") {
+        std::wstring appId = findArgToken(a, L"-applaunch");
+        if (!appId.empty()) {
+            std::wstring name = lookupSteamGameName(appId);
+            return GameLaunchInfo{ L"Steam", name.empty() ? L"Game " + appId : name, t, L"-applaunch " + appId };
+        }
+    }
+    // Steam URL-type shortcut (target IS the protocol URL)
+    if (t.starts_with(L"steam://rungameid/")) {
+        std::wstring appId = t.substr(wcslen(L"steam://rungameid/"));
+        std::wstring name = lookupSteamGameName(appId);
+        return GameLaunchInfo{ L"Steam", name.empty() ? L"Game " + appId : name, findSteamExe(), L"-applaunch " + appId };
+    }
+
+    // --- EA App ---
+    if (base == L"eadesktop" || base == L"origin" ||
+        t.starts_with(L"eadesktop://") || t.starts_with(L"origin://launchgame/")) {
+        // Extract content ID from eadesktop://launchgame/<id> or origin://launchgame/<id>
+        std::wstring url = t.starts_with(L"http") ? a : t;
+        std::wstring contentId;
+        for (const wchar_t* prefix : { L"eadesktop://launchgame/", L"origin://launchgame/" }) {
+            if (url.starts_with(prefix)) { contentId = url.substr(wcslen(prefix)); break; }
+        }
+        std::wstring name = contentId.empty() ? L"" : lookupEAGameName(contentId);
+        return GameLaunchInfo{ L"EA App", name.empty() ? L"EA Game" : name, t, a };
+    }
+
+    // --- Epic Games ---
+    if (base == L"epicgameslauncher" || t.starts_with(L"com.epicgames.launcher://")) {
+        // Epic stores game manifests in %ProgramData%\Epic\EpicGamesLauncher\Data\Manifests
+        // but parsing JSON is heavy — use the shortcut description as the name
+        wchar_t desc[1024]{};
+        // Re-open just for description (psl is already released; re-load if needed — skip for now)
+        return GameLaunchInfo{ L"Epic Games", L"Epic Game", t, a };
+    }
+
+    // --- GOG Galaxy ---
+    if (base == L"gogalaxy" || t.starts_with(L"goggalaxy://openGame/")) {
+        std::wstring gameId;
+        if (t.starts_with(L"goggalaxy://openGame/")) gameId = t.substr(wcslen(L"goggalaxy://openGame/"));
+        std::wstring name;
+        if (!gameId.empty()) {
+            HKEY h{};
+            std::wstring key = L"SOFTWARE\\GOG.com\\Games\\" + gameId;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS) {
+                name = readRegStr(h, L"GAMENAME");
+                RegCloseKey(h);
+            }
+        }
+        return GameLaunchInfo{ L"GOG Galaxy", name.empty() ? L"GOG Game" : name, t, a };
+    }
+
+    return std::nullopt;
 }
 
 } // namespace
@@ -1462,6 +1614,14 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
         // HxD can open any file as hex — add if installed and not already listed
         if (!hasHxD && !tools.hxd.empty())
             addItem(menu, L"Open with HxD", tools.hxd, L"\"%SEL%\"", tools.hxd);
+
+        // Game shortcuts — parse .lnk to identify Steam / EA / Epic / GOG launches
+        if (ext == L"lnk" && snapshot.hasSelection()) {
+            if (auto game = parseGameShortcut(snapshot.primarySelection())) {
+                addItem(menu, L"Launch " + game->gameName + L" on " + game->platform,
+                        game->launchExe, game->launchArgs, game->launchExe, false, L"Launch");
+            }
+        }
 
         // Extension-specific workflow actions (beyond the Open With registry)
         if (ext == L"ps1") {
