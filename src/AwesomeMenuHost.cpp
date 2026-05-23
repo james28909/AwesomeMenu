@@ -417,6 +417,7 @@ struct ToolPaths {
     std::wstring clion;        // CLion (JetBrains)
     std::wstring vlc;          // VLC media player
     std::wstring winMerge;     // WinMerge diff tool
+    std::wstring hxd;          // HxD hex editor
 };
 
 static ToolPaths detectTools() {
@@ -533,6 +534,13 @@ static ToolPaths detectTools() {
         if (t.winMerge.empty()) {
             if (!pf.empty())    tryPath(t.winMerge, pf    + L"\\WinMerge\\WinMergeU.exe");
             if (!pfx86.empty()) tryPath(t.winMerge, pfx86 + L"\\WinMerge\\WinMergeU.exe");
+        }
+
+        // HxD hex editor
+        t.hxd = findOnPath(L"HxD.exe");
+        if (t.hxd.empty()) {
+            if (!pf.empty())    tryPath(t.hxd, pf    + L"\\HxD\\HxD.exe");
+            if (!pfx86.empty()) tryPath(t.hxd, pfx86 + L"\\HxD\\HxD.exe");
         }
 
         // Visual Studio 2022 (check all editions)
@@ -733,7 +741,56 @@ static std::vector<OpenWithEntry> queryOpenWith(const std::wstring& ext) {
 
     RegCloseKey(hExt);
 
-    if (results.size() > 12) results.resize(12); // cap to avoid menu bloat
+    // 4. HKCU FileExts — per-user "Open With" history (not visible via HKCR)
+    std::wstring feBase = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\." + ext;
+    auto addFromOwlKey = [&](HKEY hOwl) {
+        DWORD idx = 0;
+        wchar_t vName[4]; DWORD vLen = ARRAYSIZE(vName);
+        wchar_t vData[MAX_PATH]; DWORD vDataLen = sizeof(vData);
+        DWORD type = 0;
+        while (RegEnumValueW(hOwl, idx, vName, &vLen, nullptr, &type,
+                             (BYTE*)vData, &vDataLen) == ERROR_SUCCESS) {
+            if (type == REG_SZ && vLen > 0 && vName[0] != 'M') { // skip MRUList
+                std::wstring exeName(vData, vDataLen / sizeof(wchar_t));
+                exeName.erase(exeName.find_last_not_of(L'\0') + 1); // trim nulls
+                std::wstring cmdPath = L"Applications\\" + exeName + L"\\shell\\open\\command";
+                HKEY hCmd{};
+                std::wstring exePath;
+                if (RegOpenKeyExW(HKEY_CLASSES_ROOT, cmdPath.c_str(), 0, KEY_READ, &hCmd) == ERROR_SUCCESS) {
+                    exePath = resolveExePath(extractExeFromCommand(readRegStr(hCmd, nullptr)));
+                    RegCloseKey(hCmd);
+                }
+                if (exePath.empty()) exePath = resolveExePath(exeName);
+                addEntry(std::move(exePath), L"");
+            }
+            ++idx; vLen = ARRAYSIZE(vName); vDataLen = sizeof(vData);
+        }
+    };
+    {
+        HKEY hFe{};
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, feBase.c_str(), 0, KEY_READ, &hFe) == ERROR_SUCCESS) {
+            // OpenWithProgids
+            HKEY hOwp{};
+            if (RegOpenKeyExW(hFe, L"OpenWithProgids", 0, KEY_READ, &hOwp) == ERROR_SUCCESS) {
+                DWORD idx = 0;
+                wchar_t vName[256]; DWORD vLen = ARRAYSIZE(vName);
+                while (RegEnumValueW(hOwp, idx, vName, &vLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                    if (vLen > 0) addFromProgId(vName);
+                    ++idx; vLen = ARRAYSIZE(vName);
+                }
+                RegCloseKey(hOwp);
+            }
+            // OpenWithList (MRU exe names stored as value data, not key names)
+            HKEY hOwl{};
+            if (RegOpenKeyExW(hFe, L"OpenWithList", 0, KEY_READ, &hOwl) == ERROR_SUCCESS) {
+                addFromOwlKey(hOwl);
+                RegCloseKey(hOwl);
+            }
+            RegCloseKey(hFe);
+        }
+    }
+
+    if (results.size() > 12) results.resize(12);
     s_cache[ext] = results;
     return results;
 }
@@ -1391,17 +1448,20 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
         // Query HKCR for all apps registered to open this extension
         auto openWith = queryOpenWith(ext);
 
-        bool hasNotepad = false;
+        bool hasNotepad = false, hasHxD = false;
 
         for (const auto& app : openWith) {
             addItem(menu, L"Open with " + app.displayName, app.exePath, L"\"%SEL%\"", app.exePath);
-            if (_wcsicmp(exeBaseName(app.exePath).c_str(), L"notepad") == 0) hasNotepad = true;
+            std::wstring b = exeBaseName(app.exePath);
+            if (_wcsicmp(b.c_str(), L"notepad") == 0) hasNotepad = true;
+            if (_wcsicmp(b.c_str(), L"HxD")     == 0) hasHxD     = true;
         }
 
-        // Always provide Notepad as a last-resort text fallback
-        if (!hasNotepad) {
-            addItem(menu, L"Open with Notepad", L"notepad.exe", L"\"%SEL%\"");
-        }
+        if (!hasNotepad) addItem(menu, L"Open with Notepad", L"notepad.exe", L"\"%SEL%\"");
+
+        // HxD can open any file as hex — add if installed and not already listed
+        if (!hasHxD && !tools.hxd.empty())
+            addItem(menu, L"Open with HxD", tools.hxd, L"\"%SEL%\"", tools.hxd);
 
         // Extension-specific workflow actions (beyond the Open With registry)
         if (ext == L"ps1") {
@@ -2344,14 +2404,9 @@ UINT AwesomeMenuHost::buildCascadingMenu(HMENU hParentMenu, const Flyout& flyout
         mi.wID = idNext;
         mi.dwTypeData = const_cast<LPWSTR>(item.label.c_str());
 
-        // Add icon if specified
         if (!item.icon.empty()) {
-            HBITMAP hIcon = hbitmapFromIconSpec(item.icon, 16);
-            if (hIcon) {
-                mi.fMask |= MIIM_BITMAP;
-                mi.hbmpItem = hIcon;
-                m_menuBitmaps.push_back(hIcon); // Track for cleanup
-            }
+            HBITMAP hIcon = hbitmapFromIconSpec(item.icon, GetSystemMetrics(SM_CXSMICON));
+            if (hIcon) { mi.fMask |= MIIM_BITMAP; mi.hbmpItem = hIcon; m_menuBitmaps.push_back(hIcon); }
         }
 
         InsertMenuItemW(hSubMenu, menuIndex++, TRUE, &mi);
@@ -2459,14 +2514,9 @@ UINT AwesomeMenuHost::buildCascadingMenuFixed(HMENU hParentMenu, const Flyout& f
         mi.wID = idNext;                          // Unique command ID
         mi.dwTypeData = const_cast<LPWSTR>(item.label.c_str()); // Display text
 
-        // Add icon if specified
         if (!item.icon.empty()) {
-            HBITMAP hIcon = hbitmapFromIconSpec(item.icon, 16); // Extract 16x16 icon
-            if (hIcon) {
-                mi.fMask |= MIIM_BITMAP;          // Enable bitmap display
-                mi.hbmpItem = hIcon;              // Set icon bitmap
-                m_menuBitmaps.push_back(hIcon);   // Track for cleanup
-            }
+            HBITMAP hIcon = hbitmapFromIconSpec(item.icon, GetSystemMetrics(SM_CXSMICON));
+            if (hIcon) { mi.fMask |= MIIM_BITMAP; mi.hbmpItem = hIcon; m_menuBitmaps.push_back(hIcon); }
         }
 
         // Insert menu item into submenu
@@ -2582,45 +2632,30 @@ const FlyoutItem* AwesomeMenuHost::findItemByPath(const std::vector<UINT>& path)
 
 HBITMAP AwesomeMenuHost::hbitmapFromIconSpec(const std::wstring& spec, int sizePx) {
     if (spec.empty()) return nullptr;
-
-    // Extract icon from executable
-    HICON hIcon = nullptr;
-
-    // Try to extract icon from the executable
-    ExtractIconExW(spec.c_str(), 0, nullptr, &hIcon, 1);
-
-    if (!hIcon) {
-        // Fallback: try system icons
-        if (spec == L"cmd.exe") {
-            hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        } else if (spec == L"powershell.exe" || spec == L"pwsh.exe") {
-            hIcon = LoadIconW(nullptr, IDI_INFORMATION);
-        } else {
-            hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        }
-    }
-
+    SHFILEINFOW sfi{};
+    HICON hIcon = SHGetFileInfoW(spec.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON)
+                  ? sfi.hIcon : nullptr;
+    if (!hIcon)
+        hIcon = (HICON)LoadImageW(nullptr, IDI_APPLICATION, IMAGE_ICON, sizePx, sizePx, LR_SHARED);
     if (!hIcon) return nullptr;
 
-    // Convert icon to bitmap
+    BITMAPINFOHEADER bih{};
+    bih.biSize = sizeof(bih); bih.biWidth = sizePx; bih.biHeight = -sizePx;
+    bih.biPlanes = 1; bih.biBitCount = 32; bih.biCompression = BI_RGB;
+    void* pvBits = nullptr;
     HDC hdc = GetDC(nullptr);
-    HDC hdcMem = CreateCompatibleDC(hdc);
-    HBITMAP hBitmap = CreateCompatibleBitmap(hdc, sizePx, sizePx);
-    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
-
-    // Fill with transparent background
-    RECT rect = {0, 0, sizePx, sizePx};
-    FillRect(hdcMem, &rect, (HBRUSH)GetStockObject(WHITE_BRUSH));
-
-    // Draw icon
-    DrawIconEx(hdcMem, 0, 0, hIcon, sizePx, sizePx, 0, nullptr, DI_NORMAL);
-
-    SelectObject(hdcMem, hOldBitmap);
-    DeleteDC(hdcMem);
+    HBITMAP hBmp = CreateDIBSection(hdc, (BITMAPINFO*)&bih, DIB_RGB_COLORS, &pvBits, nullptr, 0);
     ReleaseDC(nullptr, hdc);
-    DestroyIcon(hIcon);
+    if (!hBmp) { DestroyIcon(hIcon); return nullptr; }
 
-    return hBitmap;
+    ZeroMemory(pvBits, sizePx * sizePx * 4);
+    HDC hdcMem = CreateCompatibleDC(nullptr);
+    auto hOld = (HBITMAP)SelectObject(hdcMem, hBmp);
+    DrawIconEx(hdcMem, 0, 0, hIcon, sizePx, sizePx, 0, nullptr, DI_NORMAL);
+    SelectObject(hdcMem, hOld);
+    DeleteDC(hdcMem);
+    DestroyIcon(hIcon);
+    return hBmp;
 }
 
 bool AwesomeMenuHost::applyRegistryFile(const std::wstring& fullPath, const std::wstring& fileKey,
