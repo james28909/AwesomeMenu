@@ -46,6 +46,7 @@
 #include <cstring>           // memcpy for registry value buffers
 #include <cstdlib>           // wcstoul helpers
 #include <optional>          // std::optional for game shortcut detection
+#include <intshcut.h>        // IUniformResourceLocatorW for URL-type shortcuts
 
 // Global DLL reference counter for COM object lifetime management
 // Incremented when objects created, decremented when destroyed
@@ -885,25 +886,50 @@ static std::optional<GameLaunchInfo> parseGameShortcut(const std::wstring& lnkPa
     wchar_t target[MAX_PATH]{}, args[2048]{};
     psl->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH);
     psl->GetArguments(args, (int)ARRAYSIZE(args));
-    psl->Release();
 
     std::wstring t(target), a(args);
+
+    // For URL-type shortcuts (e.g. steam://rungameid/…), GetPath returns empty.
+    // Fall back to IUniformResourceLocatorW which reads the URL target directly.
+    if (t.empty()) {
+        IUniformResourceLocatorW* pUrl = nullptr;
+        if (SUCCEEDED(psl->QueryInterface(IID_IUniformResourceLocatorW, (void**)&pUrl))) {
+            wchar_t* url = nullptr;
+            if (SUCCEEDED(pUrl->GetURL(&url)) && url) {
+                t = url;
+                CoTaskMemFree(url);
+            }
+            pUrl->Release();
+        }
+    }
+
+    psl->Release();
     std::wstring base = exeBaseName(t);
     for (auto& c : base) c = towlower(c);
 
     // --- Steam ---
-    if (base == L"steam") {
+    // Shortcut formats:
+    //   steam.exe -applaunch <id>              (old style)
+    //   steam.exe steam://rungameid/<id>       (modern Steam shortcut)
+    //   target IS steam://rungameid/<id>       (URL-type .lnk)
+    auto extractRunGameId = [](const std::wstring& s) -> std::wstring {
+        static const wchar_t* prefix = L"steam://rungameid/";
+        size_t pos = s.find(prefix);
+        if (pos == std::wstring::npos) return {};
+        std::wstring id = s.substr(pos + wcslen(prefix));
+        if (auto sp = id.find_first_of(L" \t/"); sp != std::wstring::npos) id.erase(sp);
+        return id;
+    };
+
+    if (base == L"steam" || t.find(L"steam://") != std::wstring::npos) {
         std::wstring appId = findArgToken(a, L"-applaunch");
+        if (appId.empty()) appId = extractRunGameId(a);
+        if (appId.empty()) appId = extractRunGameId(t);
         if (!appId.empty()) {
+            std::wstring steamExe = t.find(L"steam://") != std::wstring::npos ? findSteamExe() : t;
             std::wstring name = lookupSteamGameName(appId);
-            return GameLaunchInfo{ L"Steam", name.empty() ? L"Game " + appId : name, t, L"-applaunch " + appId };
+            return GameLaunchInfo{ L"Steam", name.empty() ? L"Game " + appId : name, steamExe, L"-applaunch " + appId };
         }
-    }
-    // Steam URL-type shortcut (target IS the protocol URL)
-    if (t.starts_with(L"steam://rungameid/")) {
-        std::wstring appId = t.substr(wcslen(L"steam://rungameid/"));
-        std::wstring name = lookupSteamGameName(appId);
-        return GameLaunchInfo{ L"Steam", name.empty() ? L"Game " + appId : name, findSteamExe(), L"-applaunch " + appId };
     }
 
     // --- EA App ---
@@ -1666,7 +1692,6 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
 }
 
 UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hMenu, UINT indexMenu, UINT idCmdFirst, UINT uFlags) {
-    UNREFERENCED_PARAMETER(indexMenu);
     UNREFERENCED_PARAMETER(uFlags);
 
     std::vector<Flyout> activeFlyouts = m_flyouts;
@@ -1718,14 +1743,25 @@ UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hM
         return true;
     };
 
+    UINT insertAt = indexMenu;
+    UINT numInserted = 0;
     for (size_t f = 0; f < m_activeFlyouts.size(); ++f) {
         const auto& fly = m_activeFlyouts[f];
-        if (!matchShowIn(fly.showIn)) {
-            continue;
-        }
+        if (!matchShowIn(fly.showIn)) continue;
 
         std::vector<UINT> rootPath = { static_cast<UINT>(f) };
-        buildCascadingMenuFixed(hMenu, fly, idNext, rootPath, idCmdFirst);
+        buildCascadingMenuFixed(hMenu, fly, idNext, rootPath, idCmdFirst, insertAt);
+        ++insertAt;
+        ++numInserted;
+    }
+
+    // Closing separator creates our own NVIDIA-style zone
+    if (numInserted > 0) {
+        MENUITEMINFOW sep{};
+        sep.cbSize = sizeof(sep);
+        sep.fMask = MIIM_FTYPE;
+        sep.fType = MFT_SEPARATOR;
+        InsertMenuItemW(hMenu, insertAt, TRUE, &sep);
     }
 
     UINT used = idNext - idCmdFirst;
@@ -2430,10 +2466,36 @@ IFACEMETHODIMP AwesomeMenuHost::QueryContextMenu(HMENU hMenu, UINT indexMenu, UI
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
+        // Guard against double-insertion: Explorer builds two separate HMENUs for
+        // .lnk files (one for the shortcut, one for the resolved target) and calls
+        // our handler on each. Track the last HMENU+tick; skip if same menu reappears
+        // within 2 seconds (the resolved-target call always arrives within milliseconds).
+        static HMENU s_dedupMenu = nullptr;
+        static DWORD s_dedupTick = 0;
+        DWORD now = GetTickCount();
+        if (hMenu == s_dedupMenu && now - s_dedupTick < 2000)
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+        s_dedupMenu = hMenu;
+        s_dedupTick = now;
+
         ContextSnapshot snapshot = m_context;
         snapshot.kind = detectContextKind(snapshot);
 
-        UINT used = buildContextMenu(snapshot, hMenu, indexMenu, idCmdFirst, uFlags);
+        // Find position right after the first separator (Zone 1 / Zone 2 boundary) so
+        // AwesomeMenu always anchors just below the top divider regardless of context.
+        int count = GetMenuItemCount(hMenu);
+        UINT insertPos = (UINT)count; // default: append if no separator found
+        for (int i = 0; i < count; i++) {
+            MENUITEMINFOW mii{};
+            mii.cbSize = sizeof(mii);
+            mii.fMask = MIIM_FTYPE;
+            if (GetMenuItemInfoW(hMenu, i, TRUE, &mii) && (mii.fType & MFT_SEPARATOR)) {
+                insertPos = (UINT)(i + 1);
+                break;
+            }
+        }
+
+        UINT used = buildContextMenu(snapshot, hMenu, insertPos, idCmdFirst, uFlags);
         return MAKE_HRESULT(SEVERITY_SUCCESS, 0, static_cast<USHORT>(used));
     } catch (...) {
         logDebug(L"QueryContextMenu failed with an unexpected exception", LogCategory::Error);
@@ -2644,7 +2706,7 @@ UINT AwesomeMenuHost::buildCascadingMenu(HMENU hParentMenu, const Flyout& flyout
  * 4. Store ID-to-path mappings for command resolution
  * 5. Attach submenu to parent menu
  */
-UINT AwesomeMenuHost::buildCascadingMenuFixed(HMENU hParentMenu, const Flyout& flyout, UINT& idNext, std::vector<UINT>& currentPath, UINT idCmdFirst) {
+UINT AwesomeMenuHost::buildCascadingMenuFixed(HMENU hParentMenu, const Flyout& flyout, UINT& idNext, std::vector<UINT>& currentPath, UINT idCmdFirst, UINT insertAt) {
     // Create popup submenu for this flyout
     HMENU hSubMenu = CreatePopupMenu();
     if (!hSubMenu) return 0;                  // Failed to create submenu
@@ -2728,8 +2790,7 @@ UINT AwesomeMenuHost::buildCascadingMenuFixed(HMENU hParentMenu, const Flyout& f
     root.hSubMenu = hSubMenu;                     // Attach our built submenu
     root.dwTypeData = const_cast<LPWSTR>(flyout.label.c_str()); // Display text
 
-    // Insert at end of parent menu
-    InsertMenuItemW(hParentMenu, GetMenuItemCount(hParentMenu), TRUE, &root);
+    InsertMenuItemW(hParentMenu, insertAt == UINT_MAX ? (UINT)GetMenuItemCount(hParentMenu) : insertAt, TRUE, &root);
 
     return menuIndex;                             // Return number of items added
 }
@@ -2792,8 +2853,17 @@ const FlyoutItem* AwesomeMenuHost::findItemByPath(const std::vector<UINT>& path)
 
 HBITMAP AwesomeMenuHost::hbitmapFromIconSpec(const std::wstring& spec, int sizePx) {
     if (spec.empty()) return nullptr;
+
+    // Resolve bare exe names (e.g. "cmd.exe") to full system path so SHGetFileInfoW finds them
+    std::wstring resolved = spec;
+    if (spec.find(L'\\') == std::wstring::npos) {
+        wchar_t full[MAX_PATH]{};
+        if (SearchPathW(nullptr, spec.c_str(), nullptr, MAX_PATH, full, nullptr))
+            resolved = full;
+    }
+
     SHFILEINFOW sfi{};
-    HICON hIcon = SHGetFileInfoW(spec.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON)
+    HICON hIcon = SHGetFileInfoW(resolved.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON)
                   ? sfi.hIcon : nullptr;
     if (!hIcon)
         hIcon = (HICON)LoadImageW(nullptr, IDI_APPLICATION, IMAGE_ICON, sizePx, sizePx, LR_SHARED);
@@ -2815,6 +2885,18 @@ HBITMAP AwesomeMenuHost::hbitmapFromIconSpec(const std::wstring& spec, int sizeP
     SelectObject(hdcMem, hOld);
     DeleteDC(hdcMem);
     DestroyIcon(hIcon);
+
+    // Old-format icons (no 32-bit alpha channel) leave alpha=0 after DrawIconEx,
+    // making the bitmap fully transparent. Detect this and force alpha=255.
+    auto* px = static_cast<DWORD*>(pvBits);
+    int n = sizePx * sizePx;
+    bool has32Alpha = false;
+    for (int i = 0; i < n && !has32Alpha; ++i)
+        has32Alpha = (px[i] >> 24) != 0;
+    if (!has32Alpha)
+        for (int i = 0; i < n; ++i)
+            px[i] |= 0xFF000000;
+
     return hBmp;
 }
 

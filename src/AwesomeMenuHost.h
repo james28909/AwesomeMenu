@@ -311,7 +311,8 @@ private:
                            UINT& idNext, std::vector<UINT>& currentPath);
     UINT buildCascadingMenuFixed(HMENU hParentMenu,                 // Fixed menu builder with proper ID mapping
                                 const Flyout& flyout, UINT& idNext,
-                                std::vector<UINT>& currentPath, UINT idCmdFirst);
+                                std::vector<UINT>& currentPath, UINT idCmdFirst,
+                                UINT insertAt = UINT_MAX);          // UINT_MAX = append
 
     /*
      * Command Resolution System
