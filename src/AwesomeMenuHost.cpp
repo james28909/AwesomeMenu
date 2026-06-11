@@ -1970,6 +1970,7 @@ bool AwesomeMenuHost::expandPlaceholders(std::wstring& s) const {
     // Replace placeholders with actual values
     if (m_context.hasSelection()) {
         replaceAll(L"%SEL%", m_context.primarySelection());
+        replaceAll(L"%1",    m_context.primarySelection()); // standard Windows shell placeholder
     }
     if (!m_context.contextDir.empty()) {
         replaceAll(L"%DIR%", m_context.contextDir);
