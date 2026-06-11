@@ -1867,28 +1867,59 @@ void AwesomeMenuHost::parseRegistryFileSimplified(const std::wstring& filePath, 
             if (!valueName.empty() && valueName[0] == L'"' && valueName.back() == L'"') {
                 valueName = valueName.substr(1, valueName.length() - 2);
             }
+            // Treat @ as the default value (standard .reg format: @="...")
+            if (valueName == L"@") valueName.clear();
+
             if (!valueData.empty() && valueData[0] == L'"' && valueData.back() == L'"') {
                 valueData = valueData.substr(1, valueData.length() - 2);
+            }
+            // Unescape .reg string escapes: \\ -> \ and \" -> "
+            {
+                std::wstring unescaped;
+                unescaped.reserve(valueData.size());
+                for (size_t i = 0; i < valueData.size(); ++i) {
+                    if (valueData[i] == L'\\' && i + 1 < valueData.size()) {
+                        if (valueData[i+1] == L'\\') { unescaped += L'\\'; ++i; continue; }
+                        if (valueData[i+1] == L'"')  { unescaped += L'"';  ++i; continue; }
+                    }
+                    unescaped += valueData[i];
+                }
+                valueData = std::move(unescaped);
             }
 
             // Extract information based on value name
             auto& item = pendingItems[currentCommand];
 
             if (valueName == L"MUIVerb" || (valueName.empty() && !inCommandKey)) {
-                // Display label
                 item.label = valueData;
             }
             else if (valueName.empty() && inCommandKey) {
-                // Command to execute
-                item.command = valueData;
-                item.workingDir = L"%DIR%"; // Set context directory placeholder
+                // Split "exe" args or exe args into command + args
+                if (!valueData.empty() && valueData[0] == L'"') {
+                    size_t endQ = valueData.find(L'"', 1);
+                    if (endQ != std::wstring::npos) {
+                        item.command = valueData.substr(1, endQ - 1);
+                        std::wstring rest = valueData.substr(endQ + 1);
+                        size_t ns = rest.find_first_not_of(L' ');
+                        item.args = (ns != std::wstring::npos) ? rest.substr(ns) : L"";
+                    } else {
+                        item.command = valueData;
+                    }
+                } else {
+                    size_t sp = valueData.find(L' ');
+                    if (sp != std::wstring::npos) {
+                        item.command = valueData.substr(0, sp);
+                        item.args = valueData.substr(sp + 1);
+                    } else {
+                        item.command = valueData;
+                    }
+                }
+                item.workingDir = L"%DIR%";
             }
             else if (valueName == L"Icon") {
-                // Icon specification
                 item.icon = valueData;
             }
             else if (valueName == L"HasLUAShield") {
-                // UAC elevation required
                 item.runAs = true;
             }
         }
