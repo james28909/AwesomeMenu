@@ -56,6 +56,7 @@ struct FlyoutItem {
     std::wstring workingDir;    // Working directory for command execution (%DIR% = context folder)
     bool runAs = false;         // UAC elevation flag (true = run as administrator)
     std::wstring section;       // Optional grouping label for menu organization (creates separators)
+    std::wstring extensions;    // Semicolon-separated file extensions to show for (e.g. "db;sqlite"); empty = all
 };
 
 /*

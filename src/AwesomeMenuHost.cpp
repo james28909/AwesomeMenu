@@ -1610,9 +1610,26 @@ UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hM
     Flyout contextAware = createContextAwareAwesomeMenu(snapshot);
     // Fold reg-file flyouts into AwesomeMenu so they appear inside the submenu,
     // not as separate top-level context menu entries.
+    auto extMatches = [&](const std::wstring& extensions) {
+        if (extensions.empty()) return true;
+        const std::wstring& sel = snapshot.selectedExt; // lowercase, no dot
+        if (sel.empty()) return false;
+        size_t start = 0;
+        while (start < extensions.size()) {
+            size_t end = extensions.find(L';', start);
+            if (end == std::wstring::npos) end = extensions.size();
+            std::wstring tok = extensions.substr(start, end - start);
+            if (_wcsicmp(tok.c_str(), sel.c_str()) == 0) return true;
+            start = end + 1;
+        }
+        return false;
+    };
+
     for (const auto& fly : m_flyouts) {
-        for (const auto& item : fly.items)
-            contextAware.items.push_back(item);
+        for (const auto& item : fly.items) {
+            if (extMatches(item.extensions))
+                contextAware.items.push_back(item);
+        }
         for (const auto& sub : fly.subFlyouts)
             contextAware.subFlyouts.push_back(sub);
     }
@@ -1915,6 +1932,9 @@ void AwesomeMenuHost::parseRegistryFileSimplified(const std::wstring& filePath, 
             }
             else if (valueName == L"HasLUAShield") {
                 item.runAs = true;
+            }
+            else if (valueName == L"ext") {
+                item.extensions = valueData; // semicolon-separated e.g. "db;sqlite;sqlite3"
             }
         }
     }
