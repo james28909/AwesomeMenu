@@ -1749,8 +1749,6 @@ void AwesomeMenuHost::loadRegistryFilesAsSeparateFlyouts() {
         }
     }
 
-    std::set<std::wstring> currentFiles;
-
     std::wstring searchPattern = menusFolder + L"\\*.reg";
     WIN32_FIND_DATAW findData;
     HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
@@ -1760,35 +1758,25 @@ void AwesomeMenuHost::loadRegistryFilesAsSeparateFlyouts() {
             if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                 std::wstring fileName = findData.cFileName;
                 std::wstring fullPath = menusFolder + L"\\" + fileName;
-                currentFiles.insert(fileName);
 
-                removeManagedEntriesForFile(fileName);
+                Flyout flyout{};
+                flyout.name = fileName.substr(0, fileName.find_last_of(L'.'));
+                flyout.label = flyout.name;
+                flyout.showIn = L"background;directory;file";
 
-                std::vector<std::pair<std::wstring, std::wstring>> appliedEntries;
-                if (applyRegistryFile(fullPath, fileName, appliedEntries)) {
-                    storeManagedRegistryEntries(fileName, appliedEntries);
-
-                    Flyout flyout{};
-                    flyout.name = fileName.substr(0, fileName.find_last_of(L'.'));
-                    flyout.label = flyout.name;
-                    flyout.showIn = L"background;directory;file";
-
-                    try {
-                        parseRegistryFileSimplified(fullPath, flyout);
-                        if (!flyout.items.empty() || !flyout.subFlyouts.empty()) {
-                            m_flyouts.push_back(std::move(flyout));
-                        }
-                    } catch (...) {
-                        logDebug(std::format(L"Failed to parse registry file {}", fileName), LogCategory::Error);
+                try {
+                    parseRegistryFileSimplified(fullPath, flyout);
+                    if (!flyout.items.empty() || !flyout.subFlyouts.empty()) {
+                        m_flyouts.push_back(std::move(flyout));
                     }
+                } catch (...) {
+                    logDebug(std::format(L"Failed to parse {} from menus folder", fileName), LogCategory::Error);
                 }
             }
         } while (FindNextFileW(hFind, &findData));
 
         FindClose(hFind);
     }
-
-    purgeMissingRegistryFiles(currentFiles);
 }
 
 
