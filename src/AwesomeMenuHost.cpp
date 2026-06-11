@@ -1607,10 +1607,16 @@ Flyout AwesomeMenuHost::createContextAwareAwesomeMenu(const ContextSnapshot& sna
 UINT AwesomeMenuHost::buildContextMenu(const ContextSnapshot& snapshot, HMENU hMenu, UINT indexMenu, UINT idCmdFirst, UINT uFlags) {
     UNREFERENCED_PARAMETER(uFlags);
 
-    std::vector<Flyout> activeFlyouts = m_flyouts;
     Flyout contextAware = createContextAwareAwesomeMenu(snapshot);
-    activeFlyouts.insert(activeFlyouts.begin(), std::move(contextAware));
-    m_activeFlyouts = std::move(activeFlyouts);
+    // Fold reg-file flyouts into AwesomeMenu so they appear inside the submenu,
+    // not as separate top-level context menu entries.
+    for (const auto& fly : m_flyouts) {
+        for (const auto& item : fly.items)
+            contextAware.items.push_back(item);
+        for (const auto& sub : fly.subFlyouts)
+            contextAware.subFlyouts.push_back(sub);
+    }
+    m_activeFlyouts = { std::move(contextAware) };
 
     UINT idNext = idCmdFirst;
     m_idCmdFirst = idCmdFirst;
