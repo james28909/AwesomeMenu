@@ -1,11 +1,22 @@
 # Editor and assistant settings
 /.vscode/
 /.claude/
+/.codex/
 .vs/
 
 # Local scratch space
 /New folder/
 /comtext-flyout.code-workspace
+
+# Windows shortcuts (machine-specific paths, useless on other machines)
+*.lnk
+
+# Screenshots / local image captures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
 
 # CMake / Visual Studio build trees
 /build/
